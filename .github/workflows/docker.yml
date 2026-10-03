@@ -1,0 +1,179 @@
+name: docker
+
+# Сборка образа лаборатории и публикация в GitHub Container Registry.
+#
+# Куда публикуется: ghcr.io/<owner>/<repo>  (публичный, если репозиторий публичный)
+# Теги: latest (ветка по умолчанию), sha-<короткий>, и semver при теге вида v1.2.3
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # GHCR требует имена в НИЖНЕМ регистре. github.repository содержит заглавные
+  # буквы (IlyaYukhimets/BPI-W3-Voice-Assistant), поэтому metadata-action
+  # нормализует имя сам, но в ручных docker pull нужен lower-case — см. шаг
+  # «Compute image name» ниже.
+  IMAGE_RAW: ghcr.io/${{ github.repository }}
+  IMAGE_NAME: ghcr.io/ilyayukhimets/bpi-w3-voice-assistant
+
+jobs:
+  # Быстрые проверки, не требующие модели: тесты нормализации и SSML.
+  # Идут первыми, чтобы не собирать образ из заведомо сломанного кода.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Тесты работают без torch: только num2words (0.5.14 — см. requirements.txt
+      # про скомпрометированные 0.5.15/0.5.16).
+      - name: Install num2words (pinned, see requirements.txt)
+        run: pip install 'num2words==0.5.14'
+
+      - name: Run normalization and SSML tests
+        run: python tools/test_tts_core.py
+
+      - name: CLI smoke test (no dependencies needed)
+        run: |
+          python tools/voice_lab.py list
+          python tools/voice_lab.py check -t "Напомни через 10 минут, открой YouTube в 19:45"
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU нужен для сборки arm64 на x86-раннере (эмуляция).
+      # Колёса torch для linux/arm64 существуют, поэтому сборка проходит.
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      # На pull_request образ только собирается, без публикации: пушить в GHCR
+      # из PR (в т.ч. из форков) не нужно и небезопасно.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+  # Проверка, что собранный образ РАБОТАЕТ, а не просто собрался.
+  # Без этого «сборка прошла» ничего не доказывает.
+  verify:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      # На pull_request образ не публиковался — проверять нечего, кроме сборки.
+      - name: Skip on pull requests
+        if: github.event_name == 'pull_request'
+        run: echo "образ не публиковался (PR) — проверка пропущена"
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image
+        if: github.event_name != 'pull_request'
+        run: docker pull ${{ env.IMAGE_NAME }}:latest
+
+      # Команды без модели: доказывают, что интерпретатор, зависимости и сам
+      # стенд в образе рабочие.
+      - name: Smoke test (commands that need no model)
+        if: github.event_name != 'pull_request'
+        run: |
+          docker run --rm ${{ env.IMAGE_NAME }}:latest list
+          docker run --rm ${{ env.IMAGE_NAME }}:latest check -t "через 10 минут"
+          docker run --rm ${{ env.IMAGE_NAME }}:latest test
+
+      # Кэшируем модель между запусками: 145 МБ качать каждый раз незачем.
+      - name: Cache Silero model
+        if: github.event_name != 'pull_request'
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: silero-v5-5-ru-3f9553af786a7c6da468d436276eebb4
+
+      # Полный прогон синтеза: скачивает модель (если не в кэше) и проверяет
+      # реальные команды стенда внутри образа.
+      - name: Full test with model
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p models lab
+          docker run --rm -u "$(id -u):$(id -g)" \
+            -v "$PWD/models:/models" -v "$PWD/lab:/app/lab" \
+            ${{ env.IMAGE_NAME }}:latest fetch-model
+
+          echo "--- палитра ---"
+          docker run --rm -u "$(id -u):$(id -g)" \
+            -v "$PWD/models:/models" -v "$PWD/lab:/app/lab" \
+            ${{ env.IMAGE_NAME }}:latest palette -q -t "Готово."
+
+          echo "--- вердикт вопроса (должен быть ВОПРОС для warm) ---"
+          docker run --rm -u "$(id -u):$(id -g)" \
+            -v "$PWD/models:/models" -v "$PWD/lab:/app/lab" \
+            ${{ env.IMAGE_NAME }}:latest question -t "Включить свет в спальне, пожалуйста?" \
+            | tee /tmp/q.txt
+          grep -q "ВОПРОС" /tmp/q.txt
+
+          echo "--- подбор темпа ---"
+          docker run --rm -u "$(id -u):$(id -g)" \
+            -v "$PWD/models:/models" -v "$PWD/lab:/app/lab" \
+            ${{ env.IMAGE_NAME }}:latest tune --target -5 -t "Хорошо, включаю свет в гостиной."
+
+      - name: Upload sample audio
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-lab-samples
+          path: lab/**/*.ogg
+          if-no-files-found: warn
+          retention-days: 7

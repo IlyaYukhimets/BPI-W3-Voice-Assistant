@@ -44,9 +44,13 @@ VOICES = {
 FEMALE_VOICES = ("baya", "kseniya", "xenia")
 
 DEFAULT_VOICE = "baya"
-DEFAULT_MODEL = "~/models/tts/silero_v5_5_ru_ok.pt"
 DEFAULT_DEVICE = "plughw:3,0"
 """ES8316 (card 3). Принимает ТОЛЬКО стерео — моно молча не заиграет."""
+
+# Путь к модели. Переменная окружения TTS_MODEL нужна для запуска в
+# контейнере: модель лежит в примонтированном томе, а не в домашнем каталоге.
+# Приоритет: явный аргумент --model > TTS_MODEL > путь по умолчанию.
+DEFAULT_MODEL = os.environ.get("TTS_MODEL") or "~/models/tts/silero_v5_5_ru_ok.pt"
 
 # Алфавит модели: всё, что вне него, Silero вырезает без предупреждения.
 # Полный набор берётся из самой модели (get_alphabet), это лишь запасной вариант.

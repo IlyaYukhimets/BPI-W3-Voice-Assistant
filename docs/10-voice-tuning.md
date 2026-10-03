@@ -12,31 +12,68 @@
 
 ## 0. Быстрый старт: где это запускать
 
-Стенд не требует ни BPI-W3, ни Docker — **на обычном ПК работает напрямую**.
-Docker в песочнице разработки применялся только потому, что та песочница на
-`musl` (Alpine), а колёса torch собраны под `glibc`.
+Стенд не требует BPI-W3. Три способа, от простого к изолированному.
 
-### На Linux / macOS / WSL
+### Вариант А: готовый образ (ничего не надо ставить, кроме Docker)
+
+Образ публикуется в GitHub Container Registry — собирается автоматически,
+забирается готовым. Это самый простой путь: ни venv, ни CPU-колёса torch
+(про них помнить не нужно — они внутри образа).
+
+```bash
+# 1. модель (145 МБ, один раз) — скачается с докачкой и проверкой md5
+docker run --rm -v "$PWD/models:/models" \
+  ghcr.io/ilyayukhimets/bpi-w3-voice-assistant fetch-model
+
+# 2. посмотреть, что можно менять
+docker run --rm ghcr.io/ilyayukhimets/bpi-w3-voice-assistant list
+
+# 3. синтез и замеры (каталог models монтируется с моделью)
+docker run --rm -v "$PWD/models:/models" -v "$PWD/lab:/app/lab" \
+  ghcr.io/ilyayukhimets/bpi-w3-voice-assistant \
+  palette -t "Хорошо, включаю свет в гостиной. Нужно что-то ещё?"
+
+# результат: ./lab/baya-palette/*.ogg — слушать и выбирать
+```
+
+Специальные команды образа: `fetch-model` (скачать модель), `test` (прогнать
+тесты), `shell` (зайти внутрь). Остальное — подкоманды стенда.
+
+### Вариант Б: Docker Compose — и убрать одной командой
+
+Если хочется изолировать тесты и потом не оставить следов в системе:
+
+```bash
+docker compose -f docker/docker-compose.yml build
+docker compose -f docker/docker-compose.yml run --rm lab fetch-model
+docker compose -f docker/docker-compose.yml run --rm lab list
+docker compose -f docker/docker-compose.yml run --rm lab \
+  palette -t "текст"
+
+# когда больше не нужно — убрать образ, контейнеры и сеть:
+docker compose -f docker/docker-compose.yml down --rmi local -v
+```
+
+Останутся только каталоги `./models` (модель) и `./lab` (результаты) —
+их можно удалить вручную. В томах ничего не оседает.
+
+### Вариант В: напрямую, без Docker (быстрее всего для итераций)
+
+Docker в вариантах А и Б нужен только для изоляции. Если Docker не хочется,
+на обычном ПК всё работает напрямую:
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt \
   --extra-index-url https://download.pytorch.org/whl/cpu
 
-# модель (145 МБ), качать один раз
-curl -L -o silero_v5_5_ru_ok.pt \
-  https://models.silero.ai/models/tts/ru/v5_5_ru.pt
-# проверить ЦЕЛОСТНОСТЬ, а не размер: md5 должен быть
-# 3f9553af786a7c6da468d436276eebb4
-md5sum silero_v5_5_ru_ok.pt
-
+python3 tools/fetch_model.py            # с докачкой и проверкой md5
 python3 tools/voice_lab.py palette --model ./silero_v5_5_ru_ok.pt -t "текст"
 ```
 
-На **Windows** проще через WSL2 (те же команды), либо `python -m venv .venv`
-и `pip install` тем же способом — torch под Windows есть в тех же CPU-колёсах.
+На **Windows** проще через WSL2 (те же команды).
 
-### Три режима по объёму зависимостей
+### Три уровня по объёму зависимостей
 
 | Режим | Что нужно | Что доступно |
 |---|---|---|
@@ -46,17 +83,9 @@ python3 tools/voice_lab.py palette --model ./silero_v5_5_ru_ok.pt -t "текст
 `list` и `check` не грузят модель и не используют torch — их можно запускать
 сразу, чтобы посмотреть, что можно менять и что модель вырежет из текста.
 
-### Если нужен Docker (изоляция от системного Python)
-
-```bash
-docker run --rm -it -v "$PWD":/repo -w /repo python:3.12-slim bash
-pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
-python tools/voice_lab.py list      # работает сразу, модель пока не нужна
-```
-
-`--extra-index-url .../whl/cpu` **обязателен**: без него pip поставит сборку
-с CUDA и притянет несколько гигабайт `nvidia-*` библиотек, бесполезных для
-этой задачи.
+> `--extra-index-url .../whl/cpu` при установке через pip **обязателен**:
+> без него pip поставит сборку torch с CUDA и притянет несколько гигабайт
+> `nvidia-*` библиотек, бесполезных для этой задачи. В образе это уже учтено.
 
 ### На самой BPI-W3
 

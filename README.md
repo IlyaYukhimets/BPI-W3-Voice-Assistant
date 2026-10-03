@@ -65,26 +65,53 @@ bash scripts/install-deps.sh
 тексте, выравнивает громкость, сохраняет OGG для прослушивания и пишет
 `manifest.json` с замерами.
 
-**Стенд не требует BPI-W3** — работает на обычном ПК. Режимы `list` и `check`
-вообще не используют torch, остальные требуют установки `requirements.txt`.
+**Стенд не требует BPI-W3.** Проще всего — готовым образом (ничего ставить
+не нужно, кроме Docker):
 
 ```bash
-# один раз: окружение и модель
+# модель (145 МБ, один раз)
+docker run --rm -v "$PWD/models:/models" \
+  ghcr.io/ilyayukhimets/bpi-w3-voice-assistant fetch-model
+
+# что вообще можно менять
+docker run --rm ghcr.io/ilyayukhimets/bpi-w3-voice-assistant list
+
+# что модель вырежет из текста: цифры, латиница
+docker run --rm ghcr.io/ilyayukhimets/bpi-w3-voice-assistant \
+  check -t "Напомни через 10 минут"
+
+# синтез: результат в ./lab
+docker run --rm -v "$PWD/models:/models" -v "$PWD/lab:/app/lab" \
+  ghcr.io/ilyayukhimets/bpi-w3-voice-assistant \
+  palette -t "Хорошо, включаю свет в гостиной. Нужно что-то ещё?"
+```
+
+Или через Compose — с возможностью убрать всё одной командой:
+
+```bash
+docker compose -f docker/docker-compose.yml build
+docker compose -f docker/docker-compose.yml run --rm lab list
+docker compose -f docker/docker-compose.yml down --rmi local -v   # удалить всё
+```
+
+Или без Docker, напрямую (быстрее для итераций):
+
+```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
-curl -L -o silero_v5_5_ru_ok.pt https://models.silero.ai/models/tts/ru/v5_5_ru.pt
-
-# что вообще можно менять (без зависимостей)
-python3 tools/voice_lab.py list
-
-# что модель вырежет из текста: цифры, латиница (без зависимостей)
-python3 tools/voice_lab.py check -t "Напомни через 10 минут"
-
-# с синтезом (нужна модель)
+python3 tools/fetch_model.py
 python3 tools/voice_lab.py palette --model ./silero_v5_5_ru_ok.pt -t "текст"
-python3 tools/voice_lab.py compare --voices baya,kseniya,xenia -t "текст"
-python3 tools/voice_lab.py tune --target -5 -t "текст"
-python3 tools/voice_lab.py question -t "Включить свет в спальне?"
+```
+
+Команды стенда:
+
+```bash
+python3 tools/voice_lab.py list                    # что можно менять (torch не нужен)
+python3 tools/voice_lab.py check -t "…"            # ударения + цифры/латиница (torch не нужен)
+python3 tools/voice_lab.py palette -t "…"          # палитра рецептов
+python3 tools/voice_lab.py compare --voices baya,kseniya,xenia -t "…"
+python3 tools/voice_lab.py tune --target -5 -t "…"
+python3 tools/voice_lab.py question -t "…?"
 ```
 
 Тесты нормализации и SSML (без torch):
@@ -93,7 +120,7 @@ python3 tools/voice_lab.py question -t "Включить свет в спаль�
 python3 tools/test_tts_core.py      # 58 проверок
 ```
 
-Полное руководство, включая запуск в Docker — [docs/10-voice-tuning.md](docs/10-voice-tuning.md).
+Полное руководство — [docs/10-voice-tuning.md](docs/10-voice-tuning.md).
 
 ## Проверенные версии
 

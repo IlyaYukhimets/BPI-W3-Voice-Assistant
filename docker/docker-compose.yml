@@ -1,0 +1,32 @@
+# Compose для лаборатории подбора голоса.
+#
+# Смысл: изолировать тесты в контейнере и убрать его одной командой, когда
+# он больше не нужен — ничего не остаётся в системе, кроме каталогов
+# ./models и ./lab.
+#
+#   docker compose -f docker/docker-compose.yml build        # собрать
+#   docker compose -f docker/docker-compose.yml run --rm lab fetch-model
+#   docker compose -f docker/docker-compose.yml run --rm lab list
+#   docker compose -f docker/docker-compose.yml run --rm lab \
+#     palette -t "Хорошо, включаю свет в гостиной. Нужно что-то ещё?"
+#   docker compose -f docker/docker-compose.yml down --rmi local -v   # убрать всё
+#
+# Файлы, которые создаст стенд, окажутся в ./lab — их и слушать.
+# Модель кладётся в ./models и переиспользуется между запусками.
+
+services:
+  lab:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: bpi-w3-voice-lab:local
+    working_dir: /app
+    environment:
+      TTS_MODEL: /models/silero_v5_5_ru_ok.pt
+    volumes:
+      # Модель: 145 МБ, качается один раз (см. fetch-model).
+      - ../models:/models
+      # Результаты прогонов: OGG для прослушивания + manifest.json.
+      - ../lab:/app/lab
+    # Без этой строки контейнер запускается от root, а инструменту это не нужно.
+    user: "1000:1000"
