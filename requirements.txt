@@ -1,0 +1,38 @@
+# Зависимости для TTS и стенда подбора голоса (tools/voice_lab.py).
+#
+# Установка (venv на uv — python3-venv на плате отсутствует, нет ensurepip):
+#   uv venv ~/models/tts-venv --python 3.10
+#   uv pip install --python ~/models/tts-venv/bin/python -r requirements.txt \
+#     --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# ВАЖНО: --extra-index-url .../whl/cpu обязателен. Без него uv ставит
+# torch+cu130 и тянет ~2 ГБ бесполезных на ARM nvidia-* библиотек.
+#
+# Что НЕ нужно:
+#   * пакет silero — модель Silero v5_5_ru самодостаточна, загружается через
+#     torch.package без него (проверено: TTSModelMultiAcc_v3 грузится);
+#   * пакет omegaconf — нужен только старому silero-пакету;
+#   * onnxruntime — не для TTS (он для ASR/sherpa-onnx).
+#
+# Стенд (voice_lab.py) работает БЕЗ torch в режимах list и check —
+# их можно запускать на машине без зависимостей.
+
+# --- обязательные ---
+numpy>=2.0
+soundfile>=0.12
+
+# ВРЕМЕННО ТОЛЬКО версия 0.5.14!
+# 0.5.15 и 0.5.16 были опубликованы злоумышленником после фишинговой атаки
+# и содержали вредоносный код (PYSEC-2025-72, GHSA-jxr6-qrxx-2ph2).
+# Обе удалены с PyPI, но автообновление всё ещё пытается их поставить.
+num2words==0.5.14
+
+# --- torch: ТОЛЬКО CPU-колёса (см. команду установки выше) ---
+torch==2.14.1
+torchaudio==2.11.0
+
+# --- опциональные ---
+# Расстановка ударений и разрешение омографов по контексту.
+# Без него ударения расставит сама модель при синтезе
+# (put_accent/put_stress_homo=True по умолчанию).
+silero-stress==1.5
