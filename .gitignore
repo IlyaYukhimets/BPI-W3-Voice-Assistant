@@ -3,17 +3,27 @@
 *.rknn
 *.tar.bz2
 *.zip
+# Модель Silero v5_5_ru (145 МБ) — качать отдельно, см. docs/10-voice-tuning.md
+*.pt
+models/
 
 # Аудио
 *.wav
 *.mp3
+# OGG стенда — результат прогона, а не исходник
+*.ogg
 
 # Python
 .venv/
+venv/
 __pycache__/
 *.pyc
+*.py[cod]
 
 # Временные
 *.log
 *.png
 /tmp/
+
+# Результаты прогонов стенда подбора голоса
+lab/

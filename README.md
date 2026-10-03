@@ -65,16 +65,35 @@ bash scripts/install-deps.sh
 тексте, выравнивает громкость, сохраняет OGG для прослушивания и пишет
 `manifest.json` с замерами.
 
+**Стенд не требует BPI-W3** — работает на обычном ПК. Режимы `list` и `check`
+вообще не используют torch, остальные требуют установки `requirements.txt`.
+
 ```bash
-python3 tools/voice_lab.py list          # что вообще можно менять
-python3 tools/voice_lab.py check -t "…"  # ударения + цифры/латиница
-python3 tools/voice_lab.py palette -t "…"     # палитра рецептов
-python3 tools/voice_lab.py compare --voices baya,kseniya,xenia -t "…"
-python3 tools/voice_lab.py tune --target -5 -t "…"
-python3 tools/voice_lab.py question -t "…?"
+# один раз: окружение и модель
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+curl -L -o silero_v5_5_ru_ok.pt https://models.silero.ai/models/tts/ru/v5_5_ru.pt
+
+# что вообще можно менять (без зависимостей)
+python3 tools/voice_lab.py list
+
+# что модель вырежет из текста: цифры, латиница (без зависимостей)
+python3 tools/voice_lab.py check -t "Напомни через 10 минут"
+
+# с синтезом (нужна модель)
+python3 tools/voice_lab.py palette --model ./silero_v5_5_ru_ok.pt -t "текст"
+python3 tools/voice_lab.py compare --voices baya,kseniya,xenia -t "текст"
+python3 tools/voice_lab.py tune --target -5 -t "текст"
+python3 tools/voice_lab.py question -t "Включить свет в спальне?"
 ```
 
-Полное руководство — [docs/10-voice-tuning.md](docs/10-voice-tuning.md).
+Тесты нормализации и SSML (без torch):
+
+```bash
+python3 tools/test_tts_core.py      # 58 проверок
+```
+
+Полное руководство, включая запуск в Docker — [docs/10-voice-tuning.md](docs/10-voice-tuning.md).
 
 ## Проверенные версии
 
