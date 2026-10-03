@@ -1,0 +1,19 @@
+# Модели (большие файлы)
+*.onnx
+*.rknn
+*.tar.bz2
+*.zip
+
+# Аудио
+*.wav
+*.mp3
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Временные
+*.log
+*.png
+/tmp/

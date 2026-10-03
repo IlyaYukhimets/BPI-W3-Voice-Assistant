@@ -1,0 +1,21 @@
+[Unit]
+Description=Audio routing fix for ES8316 output + USB mic on BPI-W3
+After=sound.target
+Wants=sound.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sleep 5
+
+# Выход: кодек ES8316 (3.5 мм JACK)
+ExecStart=-/usr/bin/amixer -c rockchipes8316 sset 'Headphone' 3
+ExecStart=-/usr/bin/amixer -c rockchipes8316 sset 'DAC' 192
+ExecStart=-/usr/bin/amixer -c rockchipes8316 sset 'Left Headphone Mixer Left DAC' on
+ExecStart=-/usr/bin/amixer -c rockchipes8316 sset 'Right Headphone Mixer Right DAC' on
+
+# Вход: USB-микрофон
+ExecStart=-/usr/bin/amixer -c Device sset 'Mic' 100% unmute
+
+[Install]
+WantedBy=multi-user.target
