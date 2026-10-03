@@ -4,10 +4,22 @@
 # Использование:
 #   ./say.sh "Привет, я готов."
 #   echo "Текст из пайпа" | ./say.sh
-#   ./say.sh -v xenia -s 1.15 "Быстрее и женским голосом"
+#   ./say.sh -p alert "Внимание! Датчик протечки сработал."
+#   ./say.sh -p question "Включить свет в спальне?"
+#   ./say.sh -v xenia -s 1.1 -p lively "Другой голос, быстрее"
 #   ./say.sh -o /tmp/out.wav "Сохранить без воспроизведения"
+#   ./say.sh --check "Напомни через 10 минут"      # только показать риски
 #
 # Голоса: aidar, baya, kseniya, eugene, xenia (по умолчанию baya).
+# Профили интонации: neutral, warm, lively, alert, calm, question, emphasis
+#   (по умолчанию warm — победивший рецепт: 1-я фраза ниже, дальше выше,
+#    пауза 350 мс, темп 108%).
+#
+# Цифры и латиница по умолчанию ПЕРЕПИСЫВАЮТСЯ СЛОВАМИ: Silero молча вырезает
+# всё вне кириллицы, и "через 10 минут" звучит как "через минуту". Отключить
+# можно флагом -n, но тогда смысл будет теряться.
+#
+# Подбор голоса и интонации — tools/voice_lab.py (см. docs/10-voice-tuning.md).
 #
 # Замечание по железу: плата BPI-W3 отдаёт звук на кодек ES8316 (card 3),
 # который принимает ТОЛЬКО стерео — конвертация внутри tts_say.py.
@@ -16,7 +28,7 @@
 
 set -uo pipefail
 
-VENV="$HOME/models/tts-venv/bin/python"
+VENV="${TTS_PYTHON:-$HOME/models/tts-venv/bin/python}"
 BACKEND="$(dirname "$(readlink -f "$0")")/tts_say.py"
 
 if [ ! -x "$VENV" ]; then

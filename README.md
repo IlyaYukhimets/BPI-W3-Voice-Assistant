@@ -10,6 +10,8 @@
 - ⚡ NPU RK3588 доступен (драйвер 0.9.2, librknnrt 1.5.2)
 - 🔊 Вывод звука через ES8316 (3.5 мм JACK)
 - 🗣 Голосовые ответы (Silero v5_5_ru, 5 голосов, RTF 0.13–0.18)
+- 🎚 Нормализация текста (цифры/латиница → словами, иначе Silero их вырезает)
+- 🎛 Стенд подбора голоса и интонации (`tools/voice_lab.py`)
 
 ## Стек
 
@@ -36,6 +38,7 @@
 7. [Обработка аудио](docs/07-audio-processing.md)
 8. [Troubleshooting](docs/08-troubleshooting.md)
 9. [Синтез речи (TTS)](docs/09-tts.md)
+10. [Настройка голоса и интонации](docs/10-voice-tuning.md)
 
 ## Быстрый старт
 
@@ -46,9 +49,32 @@ bash scripts/install-deps.sh
 # Озвучить текст (синтез → динамик ES8316)
 ./scripts/say.sh "Привет! Я готов."
 
+# Тревожная реплика другой интонацией
+./scripts/say.sh -p alert "Внимание! Датчик протечки сработал."
+
+# Проверить, не потеряет ли модель смысл (цифры, латиница)
+./scripts/say.sh --check "Напомни через 10 минут"
+
 # Скрипт ассистента (запись 7 секунд → распознавание)
-~/assistant/listen-and-recognize.sh
+./scripts/listen-and-recognize.sh
 ```
+
+## Подбор голоса
+
+`tools/voice_lab.py` — стенд для подбора: синтезирует варианты на одном
+тексте, выравнивает громкость, сохраняет OGG для прослушивания и пишет
+`manifest.json` с замерами.
+
+```bash
+python3 tools/voice_lab.py list          # что вообще можно менять
+python3 tools/voice_lab.py check -t "…"  # ударения + цифры/латиница
+python3 tools/voice_lab.py palette -t "…"     # палитра рецептов
+python3 tools/voice_lab.py compare --voices baya,kseniya,xenia -t "…"
+python3 tools/voice_lab.py tune --target -5 -t "…"
+python3 tools/voice_lab.py question -t "…?"
+```
+
+Полное руководство — [docs/10-voice-tuning.md](docs/10-voice-tuning.md).
 
 ## Проверенные версии
 

@@ -3,6 +3,9 @@
 Проверено на BPI-W3: **RTF 0.13–0.18** (в 5–7 раз быстрее реального времени),
 5 голосов, вывод на ES8316.
 
+Настройка голоса, темпа и интонации — [10-voice-tuning.md](10-voice-tuning.md).
+Ниже — установка и базовое использование.
+
 ## Почему Silero, а не Piper
 
 Piper-голоса для русского (`ru_RU-irina/ruslan/dmitri/denis`) звучат заметно хуже.
@@ -11,7 +14,8 @@ Silero v5_5_ru даёт:
 - **автоматические ударения** (`put_accent`) — правильно читает «замки»/«замки»;
 - **омографы** (`put_stress_homo`) — различает по контексту;
 - **букву ё** (`put_yo`);
-- **вопросительную интонацию** — вопрос звучит как вопрос;
+- **вопросительную интонацию** — вопрос звучит как вопрос, но её легко
+  сломать обернув всю фразу в `pitch="high"` (см. `docs/10-voice-tuning.md`);
 - **SSML** — управление темпом, паузами;
 - 5 голосов: `aidar`, `baya`, `kseniya`, `eugene`, `xenia`.
 
@@ -36,6 +40,12 @@ uv pip install --python ~/models/tts-venv/bin/python numpy
 uv pip install --python ~/models/tts-venv/bin/python torch torchaudio \
   --index-url https://download.pytorch.org/whl/cpu
 uv pip install --python ~/models/tts-venv/bin/python silero omegaconf soundfile
+# num2words ПИНОМ на 0.5.14: версии 0.5.15 и 0.5.16 содержали вредоносный код
+# (PYSEC-2025-72, GHSA-jxr6-qrxx-2ph2) и были удалены с PyPI. Без пина
+# автообновление поставит скомпрометированную версию.
+uv pip install --python ~/models/tts-venv/bin/python 'num2words==0.5.14'
+# опционально: расстановка ударений и омографов
+uv pip install --python ~/models/tts-venv/bin/python silero-stress
 ```
 
 Без `--index-url .../whl/cpu` uv ставит `torch 2.14.1+cu130` и тянет ~2 ГБ
@@ -72,12 +82,34 @@ print('EOCD:', d.rfind(b'PK\x05\x06'), 'из', len(d))"   # должен быт�
 ```bash
 ./scripts/say.sh "Привет! Я готов."                    # синтез + вывод на динамик
 ./scripts/say.sh -v xenia -s 1.15 "Другой голос"       # голос и темп
+./scripts/say.sh -p alert "Внимание! Протечка."        # профиль интонации
 ./scripts/say.sh -o /tmp/out.wav "Сохранить в файл"    # без воспроизведения
 echo "Текст из пайпа" | ./scripts/say.sh               # чтение из stdin
+./scripts/say.sh --check "Напомни через 10 минут"      # проверить риски, без синтеза
 ```
+
+Профили (`-p`): `neutral`, `warm` (по умолчанию), `lively`, `alert`, `calm`,
+`question`, `emphasis`. Что каждый делает — [10-voice-tuning.md](10-voice-tuning.md).
+
+Цифры и латиница по умолчанию **переписываются словами** — Silero молча
+вырезает всё вне кириллицы, и «через 10 минут» звучит как «через минуту».
+Отключить можно `-n`, но тогда смысл будет теряться.
 
 Коды возврата: `0` — успех, `1` — нет venv/бэкенда, `2` — пустой текст,
 `3` — ошибка вывода ALSA, `4` — нет `aplay`.
+
+### Стенд подбора голоса (tools/voice_lab.py)
+
+```bash
+python3 tools/voice_lab.py list                   # что можно менять
+python3 tools/voice_lab.py check -t "текст"       # ударения + цифры/латиница
+python3 tools/voice_lab.py palette -t "текст"     # палитра рецептов -> OGG
+python3 tools/voice_lab.py compare --voices baya,kseniya,xenia -t "текст"
+python3 tools/voice_lab.py tune --target -5 -t "текст"
+python3 tools/voice_lab.py question -t "текст?"
+```
+
+Полное руководство — [10-voice-tuning.md](10-voice-tuning.md).
 
 ### Напрямую через Python
 
