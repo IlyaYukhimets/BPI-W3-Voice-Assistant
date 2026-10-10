@@ -34,9 +34,11 @@ jobs:
           python-version: "3.12"
 
       # Тесты работают без torch: только num2words (0.5.14 — см. requirements.txt
-      # про скомпрометированные 0.5.15/0.5.16).
-      - name: Install num2words (pinned, see requirements.txt)
-        run: pip install 'num2words==0.5.14'
+      # про скомпрометированные 0.5.15/0.5.16) и numpy — тесты протокола воркера
+      # (test_mono_from_bytes, ответ float32) гоняются на нём. numpy — это
+      # лёгкое колесо на раннере; torch сюда НЕ ставить (см. requirements.txt).
+      - name: Install num2words (pinned) and numpy (protocol tests)
+        run: pip install 'num2words==0.5.14' 'numpy>=2.0'
 
       - name: Run normalization and SSML tests
         run: python tools/test_tts_core.py
