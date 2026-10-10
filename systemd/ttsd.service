@@ -1,0 +1,17 @@
+# Пользовательский юнит (не system: работает от ubuntu, без root).
+# Установка: cp systemd/ttsd.service ~/.config/systemd/user/ && systemctl --user enable --now ttsd
+# См. docs/11-daemon.md.
+[Unit]
+Description=BPI-W3: резидентный TTS-воркер (Silero, ~770 МБ ОЗУ)
+
+[Service]
+Type=simple
+ExecStart=%h/models/tts-venv/bin/python %h/bpi-w3-voice-assistant/scripts/ttsd.py
+Restart=on-failure
+RestartSec=3
+# Потоки: 4 — замеренный оптимум для BPI-W3 (см. docs/09-tts.md).
+# При нестабильном питании вернуть 2 (как раньше): TTS_THREADS=2.
+Environment=TTS_THREADS=4
+
+[Install]
+WantedBy=default.target

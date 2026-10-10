@@ -12,6 +12,7 @@
 
 Зависимость: num2words==0.5.14 (см. docs/10-voice-tuning.md про 0.5.15/0.5.16).
 """
+import json
 import os
 import re
 import sys
@@ -38,6 +39,10 @@ def true(cond, what: str) -> None:
         PASSED += 1
     else:
         FAILED.append(what)
+
+
+def fail(what: str) -> None:
+    FAILED.append(what)
 
 
 # ---------------------------------------------------------------- время
@@ -289,12 +294,71 @@ def test_resolve_threads():
         true(err is not None, f"resolve_threads({bad}) -> ValueError")
 
 
+# ---------------------------------------------------------------- воркер и ASR
+def test_worker_protocol():
+    """Протоколы резидентных служб: путь сокета, строка запроса, разбор ответа.
+
+    Клиент и сервер пользуются ОДНОЙ сборкой запроса (core.worker_request), так
+    что тест фиксирует не реализацию, а договорённость между сторонами.
+    """
+    saved = os.environ.get(core.WORKER_SOCKET_ENV)
+    os.environ.pop(core.WORKER_SOCKET_ENV, None)
+    try:
+        eq(core.worker_socket_path(), os.path.expanduser("~/.assistant/ttsd.sock"),
+           "путь сокета по умолчанию")
+        os.environ[core.WORKER_SOCKET_ENV] = "/tmp/alt-ttsd.sock"
+        eq(core.worker_socket_path(), "/tmp/alt-ttsd.sock",
+           "TTSD_SOCKET переопределяет путь")
+    finally:
+        if saved is None:
+            os.environ.pop(core.WORKER_SOCKET_ENV, None)
+        else:
+            os.environ[core.WORKER_SOCKET_ENV] = saved
+
+    # Запрос: ровно одна строка, JSON валиден и содержит голос+SSML.
+    line = core.worker_request("baya", "<speak>привет</speak>")
+    true(line.endswith(b"\n"), "запрос к воркеру кончается \\n")
+    eq(len(line.decode("utf-8").splitlines()), 1, "запрос — ровно одна строка")
+    eq(json.loads(line.decode("utf-8")),
+       {"voice": "baya", "ssml": "<speak>привет</speak>"}, "JSON запроса")
+
+    # ASR: фрейм протокола sherpa и разбор его ответа.
+    import asr_ws
+    msg = asr_ws.samples_message(16000, b"\x00" * 8)
+    eq(msg[:8], (16000).to_bytes(4, "little") + (8).to_bytes(4, "little"),
+       "заголовок ASR-фрейма: rate (LE) и длина данных в байтах")
+    eq(len(msg), 16, "фрейм = 8 байт заголовка + данные")
+    eq(asr_ws.parse_result('{"text": "Включить свет"}'), "Включить свет",
+       "JSON-ответ ASR-сервера -> текст")
+    eq(asr_ws.parse_result("Просто текст"), "Просто текст",
+       "текстовый ответ ASR-сервера проходит без правок")
+
+
+def test_mono_from_bytes():
+    """Ответ воркера должен превращаться в перезаписываемый float32-массив."""
+    import numpy as np
+
+    raw = np.array([0.5, -0.5, 0.25], dtype=np.float32).tobytes()
+    arr = core.mono_from_bytes(raw)
+    eq(arr.dtype, np.float32, "тип данных")
+    eq(arr.tolist(), [0.5, -0.5, 0.25], "значения на месте")
+    true(arr.flags.writeable,
+         "массив перезаписываем (иначе rms_normalize упадёт позже)")
+    try:
+        core.mono_from_bytes(b"\x00\x00\x00")  # не кратно 4
+    except ValueError as e:
+        true("не кратен 4" in str(e), "ошибка про кратность 4 байтам")
+    else:
+        fail("mono_from_bytes(3 байта) должен давать ValueError")
+
+
 def main() -> int:
     for fn in (test_time, test_numbers_units, test_temperature_percent, test_latin,
                test_real_world, test_check_text, test_ssml,
                test_sentence_split, test_pitch_contour_labels,
                test_humanize_question, test_question_split,
-               test_accusative_detection, test_resolve_threads):
+               test_accusative_detection, test_resolve_threads,
+               test_worker_protocol, test_mono_from_bytes):
         fn()
 
     print(f"пройдено проверок: {PASSED}")

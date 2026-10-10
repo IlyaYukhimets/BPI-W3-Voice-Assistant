@@ -1,0 +1,26 @@
+# Пользовательский юнит для резидентного ASR.
+# Установка: cp systemd/asrd.service ~/.config/systemd/user/ && systemctl --user enable --now asrd
+# См. docs/11-daemon.md.
+[Unit]
+Description=BPI-W3: резидентный ASR-сервер (GigaAM v3 punct, ~430 МБ ОЗУ)
+
+[Service]
+Type=simple
+# websocket-сервер НЕ ОПРЕДЕЛЯЕТ "nemo_transducer" (в списке его --help его нет),
+# и его передача даёт "'vocab_size' does not exist in the metadata" — проверено.
+# Оставлен без --model-type: автоопределение грузит модель дважды, но это
+# происходит один раз при старте резидентного процесса.
+ExecStart=%h/sherpa-onnx/build-rknn/install/bin/sherpa-onnx-offline-websocket-server \
+  --port=6006 \
+  --num-threads=4 \
+  --feat-dim=64 \
+  --tokens=%h/models/gigaam-v3-punct/tokens.txt \
+  --encoder=%h/models/gigaam-v3-punct/encoder.int8.onnx \
+  --decoder=%h/models/gigaam-v3-punct/decoder.onnx \
+  --joiner=%h/models/gigaam-v3-punct/joiner.onnx \
+  --log-file=%h/.assistant/asrd.log
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -18,6 +18,7 @@ tts_core.py — общее ядро синтеза русской речи (Sile
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 
@@ -95,6 +96,45 @@ def torch_threads() -> int | None:
     except ImportError:
         return None
     return torch.get_num_threads()
+
+
+# Контакты резидентного воркера и протокол с ним.
+# Протокол описан в scripts/ttsd.py; здесь — только то, чем пользуются ОБЕ стороны,
+# чтобы клиент и сервер не разъехались: одна функция сборки запроса и один путь.
+WORKER_SOCKET_ENV = "TTSD_SOCKET"
+"""Переменная окружения с путём unix-сокета резидентного воркера."""
+
+
+def worker_socket_path() -> str:
+    """Путь unix-сокета воркера: TTSD_SOCKET, иначе ~/.assistant/ttsd.sock."""
+    return os.environ.get(WORKER_SOCKET_ENV) or os.path.join(
+        os.path.expanduser("~"), ".assistant", "ttsd.sock"
+    )
+
+
+def worker_request(voice: str, ssml: str) -> bytes:
+    """ОДНА строка запроса к воркеру: JSON + "\\n".
+
+    Общая для клиента и сервера. SSML передаётся целиком (с профилем, темпом и
+    тоном — всё это уже решено клиентом), воркер отвечает только за синтез.
+    """
+    return (json.dumps({"voice": voice, "ssml": ssml}, ensure_ascii=False)
+            + "\n").encode("utf-8")
+
+
+def mono_from_bytes(data: bytes):
+    """Ответ воркера -> моно numpy float32. Отдельная функция, чтобы клиент
+    не импортировал numpy раньше времени. Ожидает РОВНО samples*4 байт.
+
+    .copy() обязателен: frombuffer на bytes даёт массив ТОЛЬКО ДЛЯ ЧТЕНИЯ, а
+    обработка дальше (rms_normalize) переписывает значения. Копия реплики —
+    сотни килобайт, цена несопоставима с падением.
+    """
+    import numpy as np
+
+    if len(data) % 4:
+        raise ValueError(f"ответ воркера не кратен 4 байтам float32: {len(data)}")
+    return np.frombuffer(data, dtype=np.float32).copy()
 
 
 VOICES = {

@@ -14,6 +14,11 @@ TTS-бэкенд для say.sh: текст -> Silero v5_5_ru -> стерео WAV
 поднять можно флагом --threads N или переменной TTS_THREADS. Значение применяется
 ПОСЛЕ загрузки модели: пакет Silero при загрузке сам выставляет 1 поток и
 затирает всё, что поставлено раньше.
+
+РЕЗИДЕНТНЫЙ ВОРКЕР: если запущены scripts/ttsd.py, реплика идёт к нему по
+unix-сокету и синтез занимает ~0.15 с вместо 0.16+3.5 с холодного пути.
+Воркер можно обойти флагом --no-daemon; его отсутствие или падение не ломают
+say.sh — клиент молча идёт холодным путём. Путь сокета — core.worker_socket_path().
 """
 import argparse
 import os
@@ -27,6 +32,46 @@ import tts_core as core  # noqa: E402
 # Профиль по умолчанию — победивший рецепт (см. docs/10-voice-tuning.md):
 # baya + warm (первая фраза ниже тоном, дальше выше, пауза 350 мс, темп 108%).
 DEFAULT_PROFILE = "warm"
+
+
+def daemon_synth(ssml: str, voice: str, connect_timeout: float = 0.5,
+                 wait_timeout: float = 60.0):
+    """Синтез через резидентный воркер. Возвращает (байты float32, ответ) или None.
+
+    None означает «воркера нет или не смог» — вызывающий уходит холодным путём.
+    Отказ должен быть БЫСТРЫМ: реплика не должна ждать мёртвый сокет, поэтому
+    на подключение даётся 0.5 с и лишь после него — долгий таймаут на синтез.
+    """
+    import json
+    import socket
+
+    path = core.worker_socket_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(connect_timeout)
+            s.connect(path)
+            s.sendall(core.worker_request(voice, ssml))
+            s.settimeout(wait_timeout)
+            line = bytearray()
+            while not line.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    return None
+                line.extend(chunk)
+            resp = json.loads(bytes(line))
+            if not resp.get("ok") or "samples" not in resp:
+                return None
+            data, need = bytearray(), resp["samples"] * 4
+            while len(data) < need:
+                chunk = s.recv(min(65536, need - len(data)))
+                if not chunk:
+                    return None          # недогрузили — холодный путь надёжнее
+                data.extend(chunk)
+            return bytes(data), resp
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
 
 
 def main() -> int:
@@ -50,6 +95,8 @@ def main() -> int:
                     help="ALSA-устройство вывода (по умолчанию ES8316)")
     ap.add_argument("-a", "--accent", action="store_true",
                     help="расставить ударения через silero-stress (если установлен)")
+    ap.add_argument("--no-daemon", action="store_true",
+                    help="обойти резидентный воркер: модель грузится здесь (холодный путь)")
     ap.add_argument("-n", "--no-normalize", action="store_true",
                     help="НЕ переписывать цифры/латиницу словами (по умолчанию переписываем)")
     ap.add_argument("--check", action="store_true",
@@ -111,16 +158,35 @@ def main() -> int:
 
     ssml = core.build_ssml(text, profile=args.profile, rate=rate, pitch=args.pitch)
 
-    t0 = time.time()
-    model = core.build_model(threads=args.threads)
-    load_s = time.time() - t0
-    # Печатаем ФАКТИЧЕСКОЕ число потоков, а не запрошенное: модель при загрузке
-    # ставит своё, и расхождение с ожиданием один раз уже увело в сторону.
-    nthr = core.torch_threads()
+    # --- резидентный воркер быстрее холодного пути примерно в 20 раз --------
+    # say.sh каждый раз платит 3.4–3.9 с за загрузку модели. Воркер держит
+    # её в памяти, ответ приходит за доли секунды. Отказ воркера (не запущен,
+    # упал, занят) — НЕ ошибка: идём холодным путём, как раньше. Поэтому
+    # воркер можно включать и выключать независимо от say.sh.
+    got = None if args.no_daemon else daemon_synth(ssml, args.voice)
+    load_s, nthr = 0.0, "-"      # у воркера модель грузится однажды, в нём самом
+    head = "воркер недоступен"
+    if got is not None:
+        raw, info = got
+        mono = core.mono_from_bytes(raw)
+        gen_s = float(info.get("gen_s") or 0.0)
+        nthr = info.get("threads", "-")
+        # У воркера модель грузится однажды, в нём самом — поэтому тут
+        # отдельная метка: «воркер», а не «модель 0.00s».
+        perf = f"воркер | потоков {nthr}"
+    else:
+        # --- холодный путь: модель в этом процессе, как было изначально --------
+        t0 = time.time()
+        model = core.build_model(threads=args.threads)
+        load_s = time.time() - t0
+        # Печатаем ФАКТИЧЕСКОЕ число потоков, а не запрошенное: модель при
+        # загрузке ставит своё, и расхождение с ожиданием уже увело в сторону.
+        nthr = core.torch_threads()
+        perf = f"модель {load_s:.2f}s | потоков {nthr}"
 
-    t0 = time.time()
-    mono = core.synth(model, ssml, voice=args.voice)
-    gen_s = time.time() - t0
+        t0 = time.time()
+        mono = core.synth(model, ssml, voice=args.voice)
+        gen_s = time.time() - t0
 
     dur = len(mono) / core.SR
     rtf = gen_s / dur if dur else 0
@@ -130,8 +196,8 @@ def main() -> int:
         made = core.write_audio(mono, path, ogg=False)
         if not args.quiet:
             print(f"[say] {args.voice}/{args.profile} | {dur:.2f}s аудио | "
-                  f"синтез {gen_s:.2f}s | RTF {rtf:.3f} | модель {load_s:.2f}s "
-                  f"| потоков {nthr} | {made[0]}", file=sys.stderr)
+                  f"синтез {gen_s:.2f}s | RTF {rtf:.3f} | {perf} "
+                  f"| {made[0]}", file=sys.stderr)
         return 0
 
     import tempfile
@@ -142,8 +208,7 @@ def main() -> int:
         core.write_audio(mono, path, ogg=False)
         if not args.quiet:
             print(f"[say] {args.voice}/{args.profile} | {dur:.2f}s аудио | "
-                  f"синтез {gen_s:.2f}s | RTF {rtf:.3f} | модель {load_s:.2f}s "
-                  f"| потоков {nthr}",
+                  f"синтез {gen_s:.2f}s | RTF {rtf:.3f} | {perf}",
                   file=sys.stderr)
         # Колонка может быть выключена/отключена — это не ошибка синтеза,
         # поэтому код возврата aplay отделён от нашего.
