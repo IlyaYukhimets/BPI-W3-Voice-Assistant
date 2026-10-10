@@ -85,6 +85,20 @@ class SpeechGate:
         self._cand_at = None
         self._silence_run = 0
 
+    def flush(self) -> None:
+        """Забыть всё накопленное (после собственной озвучки).
+
+        Пока играет ответ, микрофон слышит динамик: и текущий сегмент, и
+        кольцо пре-ролла заполнены нашим же голосом. Их надо выбросить, иначе
+        следующий сегмент начнётся с эха реплики. Номер сегмента НЕ сбрасываем:
+        нумерация строк в журнале остаётся непрерывной.
+        """
+        self._ring.clear()
+        self._piece.clear()
+        self._triggered = False
+        self._cand_at = None
+        self._silence_run = 0
+
     def feed(self, window: bytes) -> dict | None:
         """Одно окно (WINDOW_SAMPLES int16). Возврат при закрытии сегмента:
         {"index", "pcm": bytes, "samples": int}.
@@ -232,6 +246,12 @@ def main() -> int:
                          "микрофон платы отдаёт тихий сигнал")
     ap.add_argument("--no-asr", action="store_true",
                     help="только писать сегменты в spool (для отладки)")
+    ap.add_argument("--no-reply", action="store_true",
+                    help="не отвечать голосом: только распознавать и писать в журнал")
+    ap.add_argument("--reply-template", default=None,
+                    help="шаблон ответа, {text} — распознанный текст "
+                         "(по умолчанию — шаблон-заглушка из assistant.py)")
+    ap.add_argument("--reply-voice", default=None, help="голос для озвучки ответа")
     ap.add_argument("--asr-addr", default=os.environ.get("ASR_ADDR", "127.0.0.1"))
     ap.add_argument("--asr-port", type=int, default=int(os.environ.get("ASR_PORT", "6006")))
     ap.add_argument("--keep", type=int, default=20,
@@ -253,22 +273,43 @@ def main() -> int:
                       prob_fn=vad.prob)
 
     # arecord — единственный владелец микрофона; сырое 16k int16 по stdout.
+    # stderr глушим: во время озвучки ответа мы намеренно не читаем поток, и
+    # ALSA пишет туда «overrun!!! (at least NNN ms long)» — это шум, а не
+    # ошибка. О настоящем отказе сообщит код возврата процесса (см. выход из
+    # цикла ниже): раньше это было видно только по тишине в журнале.
     arecord = subprocess.Popen(
         ["arecord", "-q", "-D", args.device, "-f", "S16_LE",
          "-r", "16000", "-c", "1", "-t", "raw"],
-        stdout=subprocess.PIPE)
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     print(f"[voiced] слушаю {args.device}; VAD {args.vad_model}", flush=True)
 
     import asyncio
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import asr_ws
+    import assistant
 
+    template = args.reply_template or assistant.DEFAULT_TEMPLATE
     pending = b""
+    muted_until = 0.0      # до этого момента окна не кормятся в VAD (своя озвучка)
+    was_muted = False
+    last_reply = None      # предыдущий ответ: по нему ловим эхо динамика
     try:
         while True:
             chunk = arecord.stdout.read(WINDOW_SAMPLES * 2 * 16)
             if not chunk:
                 break
+            if time.monotonic() < muted_until:
+                # Играет наш ответ: читаем поток (чтобы не копить буфер ALSA),
+                # но в VAD не отдаём — иначе ассистент услышит сам себя.
+                pending = b""
+                was_muted = True
+                continue
+            if was_muted:
+                # Вернулись из мьюта: сливаем накопленный хвост и забываем
+                # всё, что gate успел набрать из эха собственной реплики.
+                pending = b""
+                gate.flush()
+                was_muted = False
             pending += chunk
             while len(pending) >= WINDOW_SAMPLES * 2:
                 window, pending = pending[:WINDOW_SAMPLES * 2], pending[WINDOW_SAMPLES * 2:]
@@ -300,10 +341,34 @@ def main() -> int:
                           f"сегмент: {path}", flush=True)
                     continue
                 print(f"{got['index']}: {text}", flush=True)
+                if args.no_reply or not text.strip():
+                    continue
+                if assistant.is_echo(text, last_reply):
+                    # Хвост колонки попал в сегмент: отвечать нельзя — это цикл.
+                    print("[voiced] это эхо собственной реплики, пропускаю",
+                          flush=True)
+                    continue
+                # --- ответ: заглушка запроса в HA -> шаблон -> озвучка ---------
+                reply = assistant.make_reply(text, template)
+                assistant.stub_intent(text)
+                print(f"[reply] {reply}", flush=True)
+                muted_until = time.monotonic() + 30.0   # глухо на всю озвучку
+                rc = assistant.synth_and_play(reply, voice=args.reply_voice)
+                muted_until = time.monotonic() + 0.8    # + хвост колонки
+                was_muted = True
+                last_reply = reply
+                if rc != 0:
+                    print(f"[reply] озвучка вернула код {rc} (колонка?)", flush=True)
     except KeyboardInterrupt:
         print("[voiced] остановлен клавиатурой", file=sys.stderr)
     finally:
         arecord.terminate()
+        # Почему цикл кончился: код arecord отделяет «микрофон отвалился»
+        # от «нас останавливают» (terminate -> -15).
+        rc = arecord.wait()
+        if rc not in (-15, 0):
+            print(f"[voiced] arecord завершился с кодом {rc} — микрофон "
+                  f"{args.device} недоступен или занят?", flush=True)
     return 0
 
 

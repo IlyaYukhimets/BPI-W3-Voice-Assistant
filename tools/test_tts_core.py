@@ -585,6 +585,97 @@ def test_voiced_gate():
 PROBS = [0.0, 0.0, 0.0, 0.0]
 
 
+def test_assistant_reply():
+    """Слой ответа: шаблон вместо str.format, узнавание эха, форма будущего запроса.
+
+    Подстановка через replace — не украшение: распознанный текст приходит от
+    ASR как есть и легко содержит фигурные скобки, на которых str.format
+    падает. Эхо-защита — условие выживания цикла: микрофон и колонка на одной
+    плате, и ответ ассистента обязан быть узнан как свой.
+    """
+    import assistant
+
+    eq(assistant.make_reply("включить свет"),
+       assistant.DEFAULT_TEMPLATE.replace("{text}", "включить свет"),
+       "шаблон по умолчанию подставляет распознанный текст")
+    # Фигурные скобки и в тексте, и в шаблоне — не повод падать.
+    eq(assistant.make_reply("скажи {привет}", "Ответ: {text}"),
+       "Ответ: скажи {привет}", "скобки в тексте безопасны")
+    eq(assistant.make_reply("да", "{{json}}: {text}"),
+       "{{json}}: да", "скобки в шаблоне безопасны")
+    eq(assistant.make_reply("  пробелы  ", "{text}"), "пробелы",
+       "края текста обрезаются")
+    # ASR заканчивает фразу точкой: в шаблоне она уже есть, и без обрезки
+    # в ответе звучит «коридоре..» — двойная пунктуация слышна как пауза.
+    eq(assistant.make_reply("включить свет.", "{text}"), "включить свет",
+       "концевая точка распознанного текста снимается")
+    eq(assistant.make_reply("это вопрос?", "{text}!"), "это вопрос!",
+       "знак вопроса из ASR не удваивается")
+    true("{text}" in assistant.DEFAULT_TEMPLATE,
+         "шаблон по умолчанию содержит метку {text}")
+
+    # --- эхо собственной реплики ------------------------------------------
+    reply = "Принято: включить свет в коридоре. Отвечаю шаблоном."
+    true(assistant.is_echo(reply, reply), "точное совпадение — эхо")
+    true(assistant.is_echo("принято включить свет", reply),
+         "эхо узнаётся без регистра и пунктуации")
+    true(not assistant.is_echo("какая погода", reply),
+         "другая фраза эхом не считается")
+    true(not assistant.is_echo(reply, None), "без предыдущего ответа эха нет")
+
+    # --- заглушка запроса в HA --------------------------------------------
+    req = assistant.stub_intent("включить свет")
+    eq(req["method"], "POST", "метод будущего запроса — POST")
+    true(req["path"].startswith("/api/services/"),
+         "путь ведёт в services-API Home Assistant")
+    eq(req["json"]["text"], "включить свет", "текст кладётся в тело запроса")
+
+
+def test_gate_flush():
+    """flush() после своей озвучки: эхо динамика не попадает в сегмент."""
+    import voiced
+
+    cfg = voiced.GateConfig(threshold=0.5, min_speech=0.25, min_silence=0.3,
+                            pre_roll=0.4, sample_rate=16000)
+    gate = voiced.SpeechGate(cfg, prob_fn=lambda x: PROBS[0])
+    w = b"\x00\x00" * voiced.WINDOW_SAMPLES
+    # Набираем полное кольцо пре-ролла и открытый кандидат.
+    PROBS[0] = 0.0
+    for i in range(20):
+        gate.feed(w)
+    PROBS[0] = 0.8
+    for i in range(10):          # min_speech 0.25 с = 8 окон -> триггер
+        gate.feed(w)
+    true(gate._triggered, "перед flush сегмент открыт")
+    gate.flush()
+    eq(len(gate._piece), 0, "flush очищает текущий сегмент")
+    eq(len(gate._ring), 0, "flush очищает кольцо пре-ролла")
+    true(gate._cand_at is None, "flush снимает кандидата")
+    # После flush тишина не даёт сегмента, а речь даёт — и он целый.
+    PROBS[0] = 0.0
+    got = None
+    for i in range(30):
+        r = gate.feed(w)
+        if r:
+            got = r
+    true(got is None, "после flush тишина сегмента не даёт")
+    PROBS[0] = 1.0
+    for i in range(12):
+        gate.feed(w)
+    PROBS[0] = 0.0
+    for i in range(30):
+        r = gate.feed(w)
+        if r:
+            got = r
+    true(got is not None, "после flush речь снова распознаётся")
+    if got:
+        # Кольцо после flush успело набрать только тишину: сегмент — это
+        # 0.13 с догоняющей тишины + речь. Эхо реплики (0.4 с = 6400 сэмплов
+        # пре-ролла) дало бы куда больше: 8192 vs ~14600.
+        true(got["samples"] <= int(0.55 * 16000),
+             "в сегменте нет пре-ролла из эха (кольцо очищено flush)")
+
+
 def main() -> int:
     for fn in (test_time, test_numbers_units, test_temperature_percent, test_latin,
                test_real_world, test_check_text, test_ssml,
@@ -592,6 +683,7 @@ def main() -> int:
                test_humanize_question, test_question_split,
                test_accusative_detection, test_resolve_threads,
                test_worker_protocol, test_worker_framing, test_voiced_gate,
+               test_assistant_reply, test_gate_flush,
                test_mono_from_bytes):
         fn()
 
