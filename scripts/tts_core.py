@@ -28,10 +28,74 @@ import re
 SR = 48000
 """Частота дискретизации. 48000 — нативная для модели; ES8316 держит и 44100."""
 
-TORCH_THREADS = 2
-"""Число потоков torch. НЕ ПОДНИМАТЬ выше 2: при 8 потоках плата BPI-W3
-уходит в аппаратный сброс (просадка питания). RTF при 2 потоках всё равно
-0.13-0.18, то есть быстрее реального времени."""
+THREADS_DEFAULT = 4
+"""Число потоков torch по умолчанию — ЗАМЕРЕННЫЙ оптимум для BPI-W3, не «все ядра».
+
+Замерено на плате (baya/warm, медиана из 5 прогонов после прогрева):
+
+    фраза «Включить ли свет?» (1.2 с аудио)    3 фразы (~6 с аудио)
+    1 поток   0.215 с   RTF 0.177              0.655 с   RTF 0.108
+    2 потока  0.173 с   RTF 0.142  -20%        0.645 с   RTF 0.106   -1%
+    4 потока  0.159 с   RTF 0.132  -26%  <-    0.608 с   RTF 0.100   -7%  <-
+    8 потоков 0.212 с   RTF 0.175   -1%        0.610 с   RTF 0.100   -7%
+
+Выводы, которые отсюда следуют:
+  * больше потоков НЕ значит быстрее: 8 хуже 4 (на короткой фразе — до уровня
+    одного потока). Короткий синтез (~0.2 с) слишком мал, чтобы окупить
+    синхронизацию потоков;
+  * 4 потока выигрывают в обоих случаях, поэтому по умолчанию ставим 4;
+  * потолок выигрыша невелик (26% на коротком, 7% на длинном) — узкое место
+    не в потоках, а в самой модели.
+
+Переопределяется аргументом threads или переменной TTS_THREADS.
+"""
+
+THREADS_ENV = "TTS_THREADS"
+"""Имя переменной окружения для переопределения числа потоков."""
+
+
+def resolve_threads(threads: int | None = None) -> int:
+    """Сколько потоков отдать torch. Приоритет: аргумент -> TTS_THREADS -> THREADS_DEFAULT.
+
+    Отдельная функция появилась из-за ПОРЯДКА применения: пакет модели Silero
+    при загрузке сам вызывает set_num_threads(1), поэтому своё значение надо
+    ставить ПОСЛЕ load_pickle, иначе оно молча затирается. Проверено на плате:
+        set_num_threads(4) -> 4
+        PackageImporter(...) -> 4
+        load_pickle(...) -> 1   <-- вот здесь значение теряется
+    """
+    if threads is not None:
+        if threads < 1:
+            raise ValueError(f"потоков должно быть >= 1, получено {threads}")
+        return threads
+
+    raw = (os.environ.get(THREADS_ENV) or "").strip()
+    if not raw:
+        return THREADS_DEFAULT
+
+    try:
+        n = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"{THREADS_ENV} должно быть целым числом, получено {raw!r}"
+        ) from None
+    if n < 1:
+        raise ValueError(f"{THREADS_ENV} должно быть >= 1, получено {n}")
+    return n
+
+
+def torch_threads() -> int | None:
+    """Фактическое число потоков torch (None, если torch ещё не импортирован).
+
+    Нужна, чтобы видеть РЕАЛЬНОЕ значение, а не предполагаемое: заявленное
+    число и рантайм расходятся, и это уже приводило к неверным выводам.
+    """
+    try:
+        import torch
+    except ImportError:
+        return None
+    return torch.get_num_threads()
+
 
 VOICES = {
     "aidar": "мужской, ровный, нейтральный",
@@ -68,16 +132,20 @@ STRESS_MARK = "+"
 # Загрузка модели
 # --------------------------------------------------------------------------
 
-def build_model(path: str | None = None, threads: int = TORCH_THREADS):
+def build_model(path: str | None = None, threads: int | None = None):
     """Загружает модель Silero v5_5_ru. Требует torch — импорт внутри функции,
-    чтобы модуль можно было импортировать без torch (для справок о профилях)."""
+    чтобы модуль можно было импортировать без torch (для справок о профилях).
+
+    Порядок важен: пакет модели при загрузке сам выставляет set_num_threads(1),
+    поэтому потоки задаём ПОСЛЕ load_pickle. Поставленное до — затирается.
+    """
     import torch
 
-    torch.set_num_threads(threads)
     p = os.path.expanduser(path or DEFAULT_MODEL)
     if not os.path.exists(p):
         raise FileNotFoundError(f"нет модели: {p}")
     m = torch.package.PackageImporter(p).load_pickle("tts_models", "model")
+    torch.set_num_threads(resolve_threads(threads))
     m.to(torch.device("cpu"))
     return m
 
@@ -436,8 +504,14 @@ def build_ssml(text: str, profile: str = "warm", rate: str | None = None,
         for s in sentences:
             if s.endswith("?") and not pitch:
                 h, t = _q_tail(s)
-                inner = (seg(h, r, "low") if h else "") + \
-                        (seg(t, r, "high") if h and t else seg(s, r, pitch))
+                # Однословный вопрос: _q_tail отдаёт ВСЮ фразу как «тело» и
+                # пустой хвост. Делить нечего — озвучиваем фразу ОДИН раз.
+                # (Раньше h добавлялся по `if h`, и ветка else добавляла ту же
+                # фразу целиком — текст произносился дважды.)
+                if h and t:
+                    inner = seg(h, r, "low") + seg(t, r, "high")
+                else:
+                    inner = seg(s, r, pitch)
                 parts.append(inner)
             else:
                 parts.append(seg(s, r, pitch or "high"))

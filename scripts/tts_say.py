@@ -9,9 +9,11 @@ TTS-бэкенд для say.sh: текст -> Silero v5_5_ru -> стерео WAV
 модуль использует tools/voice_lab.py. Общее ядро нужно, чтобы стенд подбора
 мерил ровно тот звук, который потом играет ассистент.
 
-КРИТИЧНО: torch.set_num_threads() НЕ поднимать выше 2. При 8 потоках (все ядра
-RK3588) плата уходит в аппаратный сброс — просадка питания. RTF при 2 потоках
-всё равно 0.13-0.18, то есть быстрее реального времени.
+ПОТОКИ: по умолчанию 4 — замеренный оптимум для BPI-W3 (core.THREADS_DEFAULT),
+а не «все ядра»: 8 потоков на короткой фразе работают как один. Ограничить или
+поднять можно флагом --threads N или переменной TTS_THREADS. Значение применяется
+ПОСЛЕ загрузки модели: пакет Silero при загрузке сам выставляет 1 поток и
+затирает всё, что поставлено раньше.
 """
 import argparse
 import os
@@ -31,6 +33,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Синтез русской речи (Silero v5_5_ru)")
     ap.add_argument("text", nargs="?", help="текст; если пусто, читается stdin")
     ap.add_argument("-v", "--voice", default=core.DEFAULT_VOICE, choices=list(core.VOICES))
+    ap.add_argument("-t", "--threads", type=int, default=None,
+                    help="потоков на синтез (по умолчанию 4 — замеренный оптимум; или TTS_THREADS)")
     ap.add_argument("-s", "--speed", type=float, default=None,
                     help="темп как множитель (1.0 = норма); переводится в SSML rate")
     ap.add_argument("-p", "--profile", default=DEFAULT_PROFILE, choices=list(core.PROFILES),
@@ -93,8 +97,11 @@ def main() -> int:
     ssml = core.build_ssml(text, profile=args.profile, rate=rate, pitch=args.pitch)
 
     t0 = time.time()
-    model = core.build_model()
+    model = core.build_model(threads=args.threads)
     load_s = time.time() - t0
+    # Печатаем ФАКТИЧЕСКОЕ число потоков, а не запрошенное: модель при загрузке
+    # ставит своё, и расхождение с ожиданием один раз уже увело в сторону.
+    nthr = core.torch_threads()
 
     t0 = time.time()
     mono = core.synth(model, ssml, voice=args.voice)
@@ -109,7 +116,7 @@ def main() -> int:
         if not args.quiet:
             print(f"[say] {args.voice}/{args.profile} | {dur:.2f}s аудио | "
                   f"синтез {gen_s:.2f}s | RTF {rtf:.3f} | модель {load_s:.2f}s "
-                  f"| {made[0]}", file=sys.stderr)
+                  f"| потоков {nthr} | {made[0]}", file=sys.stderr)
         return 0
 
     import tempfile
@@ -120,7 +127,8 @@ def main() -> int:
         core.write_audio(mono, path, ogg=False)
         if not args.quiet:
             print(f"[say] {args.voice}/{args.profile} | {dur:.2f}s аудио | "
-                  f"синтез {gen_s:.2f}s | RTF {rtf:.3f} | модель {load_s:.2f}s",
+                  f"синтез {gen_s:.2f}s | RTF {rtf:.3f} | модель {load_s:.2f}s "
+                  f"| потоков {nthr}",
                   file=sys.stderr)
         # Колонка может быть выключена/отключена — это не ошибка синтеза,
         # поэтому код возврата aplay отделён от нашего.

@@ -208,9 +208,12 @@ def _load(args):
     if getattr(args, "quiet", False):
         _log("[i] загрузка модели...")
     t0 = time.time()
-    m = core.build_model(getattr(args, "model", None))
+    # Через build_model, а не напрямую: внутри выставляются потоки ПОСЛЕ
+    # загрузки (модель иначе затирает их на 1) — см. core.resolve_threads.
+    m = core.build_model(getattr(args, "model", None),
+                         threads=getattr(args, "threads", None))
     if getattr(args, "quiet", False):
-        _log(f"[i] модель за {time.time()-t0:.1f} с")
+        _log(f"[i] модель за {time.time()-t0:.1f} с, потоков {core.torch_threads()}")
     return m
 
 
@@ -232,6 +235,8 @@ def _emit(model, rows, out_dir, args, text, tag, profile, rate, pitch, note):
         "rate": rate, "pitch": pitch, "note": note,
         "duration_s": round(dur, 3), "gen_s": round(gen, 2),
         "rtf": round(gen / dur, 3) if dur else None,
+        # Пишем в манифест: замер должен сам сообщать, при скольких потоках он снят.
+        "threads": core.torch_threads(),
         "files": made, "ssml": ssml,
         "f0_median_hz": round(rep["median"]) if rep else None,
         "f0_start_hz": round(rep["start"]) if rep else None,
@@ -273,7 +278,7 @@ def cmd_palette(args) -> int:
 
     p = _manifest(out_dir, rows, {"kind": "palette", "voice": args.voice, "text": text})
     _log("")
-    _log(f"готово: {len(rows)} вариантов в {out_dir}")
+    _log(f"готово: {len(rows)} вариантов в {out_dir}, потоков {core.torch_threads()}")
     _log(f"манифест: {p}")
     _log("Слушать: файлы *.ogg (WAV — для дальнейшей обработки).")
     return 0
@@ -503,6 +508,9 @@ def main() -> int:
         p.add_argument("-r", "--rate", help="SSML rate, напр. 108%%")
         p.add_argument("-P", "--pitch", help="SSML pitch: high, low, +5%%")
         p.add_argument("--model", help="путь к модели (по умолчанию ~/models/tts/...)")
+        # -j как «jobs»: -t в стенде занят текстом.
+        p.add_argument("-j", "--threads", type=int, default=None,
+                       help="потоков на синтез (по умолчанию 4 — замеренный оптимум; или TTS_THREADS)")
         p.add_argument("--normalize", action="store_true", default=True,
                        help="переписать цифры/латиницу словами (по умолчанию ВКЛ)")
         p.add_argument("--no-normalize", dest="normalize", action="store_false")

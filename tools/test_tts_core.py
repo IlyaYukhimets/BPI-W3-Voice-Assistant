@@ -13,6 +13,7 @@
 Зависимость: num2words==0.5.14 (см. docs/10-voice-tuning.md про 0.5.15/0.5.16).
 """
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
@@ -173,17 +174,90 @@ def test_pitch_contour_labels():
        "короткий pitch-контур помечается ненадёжным")
 
 
+def test_question_split():
+    # Теги SSML разделяют сегменты, поэтому при «очистке» ставим ПРОБЕЛ:
+    # иначе «Нужно</prosody><prosody>ещё?» склеится в одно слово и счёт врёт.
+    def plain_words(ssml: str) -> list[str]:
+        return re.sub(r"<[^>]+>", " ", ssml).split()
+
+    # однословный вопрос НЕ дублируется в профилях (регрессия)
+    for profile in ("question", "warm", "lively"):
+        s = core.build_ssml("Готово?", profile=profile)
+        eq(len(plain_words(s)), 1,
+           f"{profile}: однословный вопрос произносится один раз")
+    # двухсловный — делится на низкое тело и высокий хвост
+    for profile in ("question", "warm", "lively"):
+        s = core.build_ssml("Нужно ещё?", profile=profile)
+        true('pitch="low"' in s and 'pitch="high"' in s,
+             f"{profile}: короткий вопрос разделён на тело и хвост")
+        eq(len(plain_words(s)), 2,
+           f"{profile}: двухсловный вопрос не дублируется")
+        eq(plain_words(s), ["Нужно", "ещё?"],
+           f"{profile}: тело и хвост сохранены в правильном порядке")
+    # тело и хвост не теряются и не повторяются
+    eq(core._q_tail("Включить свет?"), ("Включить", "свет?"), "деление на тело и хвост")
+    eq(core._q_tail("Готово?"), ("Готово?", ""), "одно слово -> тела нет")
+
+
 def test_accusative_detection():
     true(core._looks_accusative("через 5", 6), "«через» -> винительный")
     true(core._looks_accusative("за 5", 3), "«за» -> винительный")
     true(not core._looks_accusative("осталось 5", 10), "«осталось» -> не винительный")
 
 
+# ---------------------------------------------------------------- потоки
+def test_resolve_threads():
+    """Потоки: аргумент -> TTS_THREADS -> все ядра; мусор падает понятно.
+
+    Тест нужен потому, что раньше значение молча не применялось: модель Silero
+    затирала его при загрузке, и код «настраивал» то, что не работало.
+    """
+    env = core.THREADS_ENV
+    saved = os.environ.get(env)
+    try:
+        os.environ[env] = "3"
+        eq(core.resolve_threads(5), 5, "аргумент важнее переменной окружения")
+        eq(core.resolve_threads(), 3, "TTS_THREADS учитывается")
+
+        # Пробельная строка = переменная не задана (иначе int("") упал бы).
+        os.environ[env] = "   "
+        eq(core.resolve_threads(), core.THREADS_DEFAULT, "пробелы трактуются как «не задано»")
+
+        os.environ.pop(env, None)
+        eq(core.resolve_threads(), core.THREADS_DEFAULT,
+           "по умолчанию — замеренный оптимум, а не все ядра")
+        true(core.THREADS_DEFAULT >= 1, "THREADS_DEFAULT — положительное число")
+
+        for bad in ("abc", "0", "-1", "2.5"):
+            os.environ[env] = bad
+            err = None
+            try:
+                core.resolve_threads()
+            except ValueError as e:
+                err = e
+            true(err is not None and env in str(err),
+                 f"{bad!r} в TTS_THREADS -> ValueError с упоминанием {env}")
+    finally:
+        if saved is None:
+            os.environ.pop(env, None)
+        else:
+            os.environ[env] = saved
+
+    for bad in (0, -2):
+        err = None
+        try:
+            core.resolve_threads(bad)
+        except ValueError as e:
+            err = e
+        true(err is not None, f"resolve_threads({bad}) -> ValueError")
+
+
 def main() -> int:
     for fn in (test_time, test_numbers_units, test_temperature_percent, test_latin,
                test_real_world, test_check_text, test_ssml,
                test_sentence_split, test_pitch_contour_labels,
-               test_accusative_detection):
+               test_question_split,
+               test_accusative_detection, test_resolve_threads):
         fn()
 
     print(f"пройдено проверок: {PASSED}")
