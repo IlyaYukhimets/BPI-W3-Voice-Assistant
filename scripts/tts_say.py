@@ -39,6 +39,10 @@ def main() -> int:
                     help="темп как множитель (1.0 = норма); переводится в SSML rate")
     ap.add_argument("-p", "--profile", default=DEFAULT_PROFILE, choices=list(core.PROFILES),
                     help="профиль интонации (по умолчанию warm)")
+    ap.add_argument("--human", default=None, choices=list(core.QUESTION_TURNS),
+                    metavar="STYLE",
+                    help="переформулировать вопрос «по-человечески»: " +
+                         " | ".join(core.QUESTION_TURNS))
     ap.add_argument("-P", "--pitch", default=None,
                     help="тон: high/low/+5%%/-10%% (перекрывает профиль)")
     ap.add_argument("-o", "--output", help="сохранить WAV и не воспроизводить")
@@ -84,6 +88,17 @@ def main() -> int:
         if pairs and not args.quiet:
             for src, dst in pairs:
                 print(f"[say] ударение: {src} -> {dst}", file=sys.stderr)
+
+    # --- «человечный» вопрос: оборот вместо одного pitch -------------------
+    # Silero не умеет вопросительную интонацию, и на короткой фразе pitch
+    # даёт скачущую высоту при том, что фраза звучит утверждением. Оборот
+    # («ли», «Может,», «..., да?») делает вопрос вопросом ЛЕКСИЧЕСКИ —
+    # см. замеры в tts_core.QUESTION_TURNS.
+    if args.human:
+        before = text
+        text = core.humanize_question(text, style=args.human)
+        if not args.quiet and text != before:
+            print(f"[say] вопрос -> {text}", file=sys.stderr)
 
     # --- темп: множитель -> SSML rate -------------------------------------
     rate = None

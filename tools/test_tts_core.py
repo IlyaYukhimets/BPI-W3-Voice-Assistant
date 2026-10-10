@@ -174,6 +174,43 @@ def test_pitch_contour_labels():
        "короткий pitch-контур помечается ненадёжным")
 
 
+def test_humanize_question():
+    # значение по умолчанию — выбранный на слух оборот «ли»
+    eq(core.humanize_question("Включить свет?"), "Включить ли свет?",
+       "по умолчанию применяется оборот «ли»")
+    # «ли» ставится после первого слова
+    eq(core.humanize_question("Включить свет?", style="li"), "Включить ли свет?",
+       "оборот «ли» после первого слова")
+    # однословный вопрос: «ли» не встаёт, уходим на хвостик
+    eq(core.humanize_question("Готово?", style="li"), "Готово, да?",
+       "однословный вопрос не получает «ли»")
+    eq(core.humanize_question("Включить свет?", style="maybe"), "Может, включить свет?",
+       "зачин «Может,» и понижение регистра")
+    eq(core.humanize_question("Готово?", style="tag"), "Готово, да?",
+       "хвостик «, да?»")
+    eq(core.humanize_question("Ты уверен?", style="verno"), "Ты уверен, верно?",
+       "хвостик «, верно?»")
+    # утверждения не трогаем
+    eq(core.humanize_question("Включаю свет.", style="maybe"), "Включаю свет.",
+       "утверждение остаётся без изменений")
+    # идемпотентность: повторный прогон ничего не добавляет
+    once = core.humanize_question("Включить свет?", style="tag")
+    eq(core.humanize_question(once, style="tag"), once,
+       "повторный вызов не дублирует оборот")
+    true(core.humanize_question("Включить ли свет?", style="li") == "Включить ли свет?",
+         "уже готовый оборот не удваивается")
+    # смешанный текст: вопрос переформулирован, ответ — нет
+    eq(core.humanize_question("Свет включён. Нужно ещё?", style="maybe"),
+       "Свет включён. Может, нужно ещё?",
+       "в смешанном тексте трогается только вопрос")
+    # неизвестный стиль — явная ошибка, а не молчаливое игнорирование
+    try:
+        core.humanize_question("Готово?", style="nope")
+        true(False, "неизвестный оборот должен падать")
+    except ValueError:
+        true(True, "неизвестный оборот -> ValueError")
+
+
 def test_question_split():
     # Теги SSML разделяют сегменты, поэтому при «очистке» ставим ПРОБЕЛ:
     # иначе «Нужно</prosody><prosody>ещё?» склеится в одно слово и счёт врёт.
@@ -256,7 +293,7 @@ def main() -> int:
     for fn in (test_time, test_numbers_units, test_temperature_percent, test_latin,
                test_real_world, test_check_text, test_ssml,
                test_sentence_split, test_pitch_contour_labels,
-               test_question_split,
+               test_humanize_question, test_question_split,
                test_accusative_detection, test_resolve_threads):
         fn()
 

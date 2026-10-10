@@ -248,6 +248,66 @@ def _emit(model, rows, out_dir, args, text, tag, profile, rate, pitch, note):
     return row
 
 
+def cmd_human(args) -> int:
+    """Сравнить речевые обороты для вопроса на ОДНОМ тексте.
+
+    Проблема, которую это решает: Silero не имеет вопросительной интонации,
+    и на короткой фразе pitch даёт скачущую высоту, а фраза всё равно
+    слышится утверждением. Оборот делает вопрос вопросом ЛЕКСИЧЕСКИ.
+    Решение принимается НА СЛУХ: синтезируем все обороты подряд, выравниваем
+    громкость и кладём рядом метку голосом, которого нет среди кандидатов.
+    """
+    text = args.text or DEFAULT_TEXT
+    out_dir = os.path.join(args.out, f"{args.voice}-human")
+    os.makedirs(out_dir, exist_ok=True)
+    _log(f"ТЕКСТ: {text}")
+    _log(f"ГОЛОС: {args.voice}   выход: {out_dir}")
+    if args.normalize:
+        text = core.normalize_text(text)
+    _log("")
+
+    model = _load(args)
+    # метка голосом aidar — мужской, его нет среди женских кандидатов,
+    # поэтому метку не спутать с образцом
+    marker_voice = "aidar" if args.voice != "aidar" else "xenia"
+
+    rows = []
+    _log(f"{'оборот':<9} {'длит':>7} {'старт':>7} {'хвост':>7} {'пик':>6}  фраза")
+    _log("-" * 84)
+    variants = [(None, text)] + [(st, core.humanize_question(text, style=st))
+                                 for st in core.QUESTION_TURNS]
+    for st, t in variants:
+        try:
+            # метка голосом marker_voice -> отдельный файл
+            # ВАЖНО: метка только кириллицей — латиница («Вариант li.») валит
+            # разбор SSML у этой модели (см. QUESTION_TURN_LABELS).
+            if args.marker:
+                label = core.QUESTION_TURN_LABELS.get(st, "как есть")
+                mssml = core.build_ssml(f"Вариант {label}.", profile="calm")
+                mmono = core.rms_normalize(core.synth(model, mssml, voice=marker_voice))
+                core.write_audio(mmono, os.path.join(out_dir, f"00-{st or 'base'}-mark.wav"),
+                                 ogg=True)
+            row = _emit(model, rows, out_dir, args, t, st or "base", "warm",
+                        None, None, core.QUESTION_TURNS.get(st, "как есть"))
+            row["turn"] = st or "base"
+            row["original"] = text
+            rows.append(row)
+            _log(f"{st or 'base':<9} {row['duration_s']:6.2f}s "
+                 f"{str(row['f0_start_hz']):>6}Гц {str(row['tail_gain']):>7} "
+                 f"{str(row['peak_pos']):>6}  {t}")
+        except Exception as e:
+            _log(f"{st or 'base':<9} ОШИБКА: {type(e).__name__}: {str(e)[:44]}")
+
+    p = _manifest(out_dir, rows, {"kind": "human", "voice": args.voice,
+                                 "text": text, "marker_voice": marker_voice})
+    _log("")
+    _log(f"готово: {len(rows)} вариантов в {out_dir}, потоков {core.torch_threads()}")
+    _log(f"манифест: {p}")
+    _log("Слушать *.ogg по порядку. Метка (голос "
+         f"{marker_voice}) называет оборот перед каждым образцом.")
+    return 0
+
+
 def cmd_palette(args) -> int:
     text = args.text or DEFAULT_TEXT
     out_dir = os.path.join(args.out, f"{args.voice}-palette")
@@ -451,6 +511,8 @@ def cmd_say(args) -> int:
     text = args.text or DEFAULT_TEXT
     if args.normalize:
         text = core.normalize_text(text)
+    if getattr(args, "human", None):
+        text = core.humanize_question(text, style=args.human)
     if args.accent:
         text, pairs = core.accentuate(text)
         if pairs and not args.quiet:
@@ -548,9 +610,19 @@ def main() -> int:
     common(p)
     p.set_defaults(func=cmd_question)
 
+    p = sub.add_parser("human", help="сравнить речевые обороты для вопроса")
+    common(p)
+    p.add_argument("--marker", action="store_true", default=True,
+                   help="озвучить метку оборота чужим голосом (по умолчанию ВКЛ)")
+    p.add_argument("--no-marker", dest="marker", action="store_false")
+    p.set_defaults(func=cmd_human)
+
     p = sub.add_parser("say", help="озвучить один вариант")
     common(p)
     p.add_argument("-d", "--device", default=core.DEFAULT_DEVICE)
+    p.add_argument("--human", default=None, choices=list(core.QUESTION_TURNS),
+                   metavar="STYLE", help="переформулировать вопрос: " +
+                   " | ".join(core.QUESTION_TURNS))
     p.set_defaults(func=cmd_say)
 
     args = ap.parse_args()

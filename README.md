@@ -132,12 +132,13 @@ python3 tools/voice_lab.py palette -t "…"          # палитра рецеп
 python3 tools/voice_lab.py compare --voices baya,kseniya,xenia -t "…"
 python3 tools/voice_lab.py tune --target -5 -t "…"
 python3 tools/voice_lab.py question -t "…?"
+python3 tools/voice_lab.py human -t "Включить свет?"   # речевые обороты для вопроса
 ```
 
 Тесты нормализации и SSML (без torch):
 
 ```bash
-python3 tools/test_tts_core.py      # 58 проверок
+python3 tools/test_tts_core.py      # нормализация, SSML, обороты вопросов (без torch)
 ```
 
 Полное руководство — [docs/10-voice-tuning.md](docs/10-voice-tuning.md).
