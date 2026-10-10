@@ -129,6 +129,16 @@ def test_ssml():
     true('pitch="low"' in s, "профиль question: есть низкий старт (запас по высоте)")
     true(s.count('pitch="high"') >= 1, "профиль question: есть высокий хвост")
 
+    # Вопрос из двух слов делится на низкое тело и высокий хвост; одно слово
+    # не повышается целиком, потому что ему не из чего строить контур.
+    for profile in ("question", "warm", "lively"):
+        s = core.build_ssml("Нужно ещё?", profile=profile)
+        true('pitch="low"' in s and 'pitch="high"' in s,
+             f"{profile}: короткий вопрос разделён на тело и хвост")
+        s = core.build_ssml("Готово?", profile=profile)
+        true('pitch="high"' not in s,
+             f"{profile}: однословный вопрос не повышен целиком")
+
     # темп: warm использует проверенную ступень 108%
     s = core.build_ssml("Привет. Как дела?", profile="warm")
     true('rate="108%"' in s, "профиль warm: темп 108% (замеренная ступень)")
@@ -151,6 +161,18 @@ def test_sentence_split():
     eq(s, ["Первое.", "Второе!", "Третье?"], "разбивка по фразам с сохранением знака")
 
 
+def test_pitch_contour_labels():
+    rising = {"dur": 2.0, "tail_gain": 1.2, "start": 200, "peak_pos": 0.8}
+    falling = {"dur": 2.0, "tail_gain": 0.8, "start": 200, "peak_pos": 0.2}
+    short = {"dur": 1.0, "tail_gain": 1.2, "start": 200, "peak_pos": 0.8}
+    eq(core.judge_question(rising)[0], "ХВОСТ ВЫШЕ",
+       "pitch-метрика описывает подъём, а не вопрос")
+    eq(core.judge_question(falling)[0], "ХВОСТ НИЖЕ",
+       "pitch-метрика описывает падение, а не утверждение")
+    eq(core.judge_question(short)[0], "НЕЯСНО",
+       "короткий pitch-контур помечается ненадёжным")
+
+
 def test_accusative_detection():
     true(core._looks_accusative("через 5", 6), "«через» -> винительный")
     true(core._looks_accusative("за 5", 3), "«за» -> винительный")
@@ -160,7 +182,8 @@ def test_accusative_detection():
 def main() -> int:
     for fn in (test_time, test_numbers_units, test_temperature_percent, test_latin,
                test_real_world, test_check_text, test_ssml,
-               test_sentence_split, test_accusative_detection):
+               test_sentence_split, test_pitch_contour_labels,
+               test_accusative_detection):
         fn()
 
     print(f"пройдено проверок: {PASSED}")

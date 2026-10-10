@@ -19,7 +19,7 @@ voice_lab.py — стенд подбора голоса и интонации д
   palette   палитра вариантов одного текста  -> OGG-файлы + manifest.json
   compare   один текст разными голосами      -> OGG-файлы + метрики
   tune      лестница темпа с ЗАМЕРОМ факта   -> подбор нужного ускорения
-  question  проверка интонации вопроса по профилям -> вердикт ВОПРОС/УТВЕРЖДЕНИЕ
+  question  сравнение pitch-контуров (не распознаёт вопросительность)
   say       озвучить один вариант в файл или на динамик
 
 ПРИМЕРЫ
@@ -27,7 +27,7 @@ voice_lab.py — стенд подбора голоса и интонации д
   python3 tools/voice_lab.py list
 
   # палитра на нужном тексте (появится ./lab/out/*.ogg — их и слушать)
-  python3 tools/voice_lab.py palette -t "Хорошо, включаю свет в гостиной. Нужно что-то ещё?"
+  python3 tools/voice_lab.py palette -t "Хорошо, включаю свет в гостиной. Нужно ли мне сделать что-то *ещё*?"
 
   # сравнить голоса на одном тексте, честно по громкости
   python3 tools/voice_lab.py compare -v baya,kseniya,xenia -t "Добрый вечер!"
@@ -59,7 +59,7 @@ except ImportError:  # скрипт лежит рядом с tts_core.py
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import tts_core as core
 
-DEFAULT_TEXT = "Хорошо, включаю свет в гостиной. Нужно что-то ещё?"
+DEFAULT_TEXT = "Хорошо, включаю свет в гостиной. Нужно ли мне сделать что-то *ещё*?"
 
 # Палитра рецептов для команды palette. Ключи — короткие, чтобы имена файлов
 # были читаемыми: их видно в плеере и на телефоне.
@@ -72,7 +72,7 @@ PALETTE = [
     ("05-lively", "lively", None, None, "бодро, фразы раздельно"),
     ("06-calm", "calm", None, None, "медленнее и ниже"),
     ("07-alert", "alert", None, None, "тревожная реплика"),
-    ("08-question", "question", None, None, "вопрос с высоким хвостом"),
+    ("08-question", "question", None, None, "эвристика низкого старта и высокого хвоста"),
     ("09-emphasis", "emphasis", None, None, "акцент на первом слове"),
 ]
 
@@ -101,7 +101,6 @@ def cmd_list(_args) -> int:
     for name, desc in core.VOICES.items():
         mark = "  <- по умолчанию" if name == core.DEFAULT_VOICE else ""
         _log(f"  {name:<9} {desc}{mark}")
-    _log(f"\n  женские: {', '.join(core.FEMALE_VOICES)}")
 
     _log("\nПРОФИЛИ ИНТОНАЦИИ (--profile)")
     for name, desc in core.PROFILES.items():
@@ -118,7 +117,10 @@ def cmd_list(_args) -> int:
     _log("\nSSML: что поддержано:")
     _log("  ДА  : prosody(rate,pitch), break(time), <s>, <p>")
     _log("  НЕТ : emphasis, say-as, sub, voice  (ValueError)")
-    _log("  pitch понимает проценты: pitch=\"+5%\", \"-10%\"")
+    _log("  по справке Silero pitch: x-low/low/medium/high/x-high")
+    _log("  по справке Silero rate: x-slow/slow/medium/fast/x-fast")
+    _log("  проценты в рецептах проекта проверены отдельно, но не перечислены")
+    _log("  в официальной SSML-справке")
     _log("  ручное ударение: знак + ПЕРЕД гласной -> хор+ошо, замк+и")
     return 0
 
@@ -224,7 +226,7 @@ def _emit(model, rows, out_dir, args, text, tag, profile, rate, pitch, note):
     path = os.path.join(out_dir, f"{args.voice}-{tag}.wav")
     made = core.write_audio(mono, path, ogg=True)
     rep = core.intonation_report(mono)
-    verdict, why = core.judge_question(rep) if rep else ("-", "")
+    contour, why = core.judge_question(rep) if rep else ("-", "")
     row = {
         "tag": tag, "voice": args.voice, "profile": profile,
         "rate": rate, "pitch": pitch, "note": note,
@@ -236,7 +238,7 @@ def _emit(model, rows, out_dir, args, text, tag, profile, rate, pitch, note):
         "f0_peak_hz": round(rep["peak"]) if rep else None,
         "peak_pos": round(rep["peak_pos"], 3) if rep else None,
         "tail_gain": round(rep["tail_gain"], 3) if rep else None,
-        "intonation": verdict, "why": why,
+        "intonation": contour, "why": why,
     }
     return row
 
@@ -322,7 +324,7 @@ def cmd_compare(args) -> int:
 def cmd_tune(args) -> int:
     """Замер ФАКТИЧЕСКОГО эффекта темпа. Нужен всегда, когда хочется сказать
     «ускорил на N%»: номинал и факт расходятся в разы."""
-    text = args.text or "Хорошо, включаю свет в гостиной. Нужно что-то ещё?"
+    text = args.text or "Хорошо, включаю свет в гостиной. Нужно ли мне сделать что-то *ещё*?"
     if args.normalize:
         text = core.normalize_text(text)
     if args.accent:
@@ -381,11 +383,7 @@ def cmd_tune(args) -> int:
 
 
 def cmd_question(args) -> int:
-    """Проверка, звучит ли фраза вопросом. Русский вопрос (ИК-3) отличается
-    от утверждения ФОРМОЙ контура: максимум F0 смещён к концу фразы.
-    Если обернуть весь вопрос в pitch="high", старт становится высоким,
-    восходящей дуге некуда расти — и вопрос вырождается в утверждение.
-    Это ровно та ошибка, которую ловит эта команда."""
+    """Сравнивает варианты высоты тона; метрики не распознают вопросительность."""
     text = args.text or "Включить свет в спальне?"
     out_dir = os.path.join(args.out, f"{args.voice}-question")
     os.makedirs(out_dir, exist_ok=True)
@@ -397,35 +395,33 @@ def cmd_question(args) -> int:
     _log(f"ВОПРОС: {text}")
     _log(f"ГОЛОС: {args.voice}")
     _log("")
-    _log("Критерий (ИК-3, русская вопросительная интонация):")
-    _log("  * максимум F0 ближе к КОНЦУ фразы (peak_pos >= ~0.55)")
-    _log("  * хвост выше начала (tail_gain > ~1.03)")
-    _log("  * старт НЕ у верхней границы (иначе дуге некуда расти)")
+    _log("Метрики показывают только контур высоты тона, не тип высказывания.")
+    _log("Сравнивай звучание на слух: Silero не предоставляет режима «вопрос».")
     _log("")
 
     model = _load(args)
     variants = [
         ("whole-high", "neutral", "108%", "high",
-         "ВСЯ фраза высоким тоном — так вопрос вырождается в утверждение"),
+         "вся фраза на high — сравнить с вариантами без настройки"),
         ("whole-low", "neutral", "108%", "low", "вся фраза низким тоном"),
         ("plain", "neutral", None, None, "без настроек тона"),
         ("tail-high", "question", None, None,
-         "низкий старт + высокий ХВОСТ — правильная ИК-3"),
+         "низкий старт + высокий хвост (эвристика SSML)"),
         ("warm", "warm", None, None, "профиль warm (первая фраза ниже, дальше выше)"),
     ]
     rows = []
     _log(f"{'вариант':<11} {'старт':>7} {'пик':>7} {'пик_поз':>8} {'хвост':>7} "
-         f"{'вердикт':<13} пояснение")
+         f"{'контур':<18} пояснение")
     _log("-" * 100)
     for tag, profile, rate, pitch, note in variants:
         ssml = core.build_ssml(text, profile=profile, rate=rate, pitch=pitch)
         mono = core.synth(model, ssml, voice=args.voice)
         rep = core.intonation_report(mono)
-        verdict, why = core.judge_question(rep) if rep else ("не измерить", "")
+        contour, why = core.judge_question(rep) if rep else ("не измерить", "")
         path = os.path.join(out_dir, f"{args.voice}-q-{tag}.wav")
         core.write_audio(mono, path, ogg=True)
         rows.append({"tag": tag, "profile": profile, "rate": rate, "pitch": pitch,
-                     "note": note, "verdict": verdict, "why": why, "ssml": ssml,
+                     "note": note, "contour": contour, "why": why, "ssml": ssml,
                      "f0_start_hz": round(rep["start"]) if rep else None,
                      "f0_peak_hz": round(rep["peak"]) if rep else None,
                      "peak_pos": round(rep["peak_pos"], 3) if rep else None,
@@ -434,7 +430,7 @@ def cmd_question(args) -> int:
         if rep:
             _log(f"{tag:<11} {rep['start']:6.0f}Гц {rep['peak']:6.0f}Гц "
                  f"{rep['peak_pos']:8.2f} {rep['tail_gain']:7.2f} "
-                 f"{verdict:<13} {note}")
+                 f"{contour:<18} {note}")
         else:
             _log(f"{tag:<11} не измерить   {note}")
 
@@ -540,7 +536,7 @@ def main() -> int:
                    help="целевое изменение длительности в %%, напр. -5")
     p.set_defaults(func=cmd_tune)
 
-    p = sub.add_parser("question", help="проверить, звучит ли фраза вопросом")
+    p = sub.add_parser("question", help="сравнить pitch-контуры; не распознаёт вопрос")
     common(p)
     p.set_defaults(func=cmd_question)
 

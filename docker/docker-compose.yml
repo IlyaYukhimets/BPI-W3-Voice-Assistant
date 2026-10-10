@@ -5,12 +5,20 @@
 # ./models и ./lab.
 #
 #   docker compose -f docker/docker-compose.yml build        # собрать
+#   export PUID="$(id -u)" PGID="$(id -g)"
 #   docker compose -f docker/docker-compose.yml run --rm lab fetch-model
 #   docker compose -f docker/docker-compose.yml run --rm lab list
 #   docker compose -f docker/docker-compose.yml run --rm lab \
-#     palette -t "Хорошо, включаю свет в гостиной. Нужно что-то ещё?"
+#     palette -t "Хорошо, включаю свет в гостиной. Нужно Нужно ли мне сделать что-то *ещё*?"
+#   docker compose -f docker/docker-compose.yml run --rm lab \
+#     palette -v kseniya -t "Хорошо, включаю свет в гостиной."
+#   docker compose -f docker/docker-compose.yml run --rm lab \
+#     compare --voices aidar,baya,kseniya,eugene,xenia -t "Добрый вечер!"
 #   docker compose -f docker/docker-compose.yml down --rmi local -v   # убрать всё
 #
+# Доступные голоса: aidar, baya, kseniya, eugene, xenia.
+# Команда palette строит палитру для одного голоса;
+# compare сопоставляет голоса на одной фразе.
 # Файлы, которые создаст стенд, окажутся в ./lab — их и слушать.
 # Модель кладётся в ./models и переиспользуется между запусками.
 
@@ -28,5 +36,6 @@ services:
       - ../models:/models
       # Результаты прогонов: OGG для прослушивания + manifest.json.
       - ../lab:/app/lab
-    # Без этой строки контейнер запускается от root, а инструменту это не нужно.
-    user: "1000:1000"
+    # Совпадает с владельцем bind-mount каталогов на хосте.
+    # Перед запуском задайте PUID/PGID текущего пользователя (см. README).
+    user: "${PUID:-1000}:${PGID:-1000}"

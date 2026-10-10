@@ -69,8 +69,11 @@ bash scripts/install-deps.sh
 не нужно, кроме Docker):
 
 ```bash
+# Каталоги для bind mounts должны принадлежать текущему пользователю.
+mkdir -p models lab
+
 # модель (145 МБ, один раз)
-docker run --rm -v "$PWD/models:/models" \
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/models:/models" \
   ghcr.io/ilyayukhimets/bpi-w3-voice-assistant fetch-model
 
 # что вообще можно менять
@@ -81,18 +84,35 @@ docker run --rm ghcr.io/ilyayukhimets/bpi-w3-voice-assistant \
   check -t "Напомни через 10 минут"
 
 # синтез: результат в ./lab
-docker run --rm -v "$PWD/models:/models" -v "$PWD/lab:/app/lab" \
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD/models:/models" -v "$PWD/lab:/app/lab" \
   ghcr.io/ilyayukhimets/bpi-w3-voice-assistant \
-  palette -t "Хорошо, включаю свет в гостиной. Нужно что-то ещё?"
+  palette -t "Хорошо, включаю свет в гостиной. Нужно ли мне сделать что-то *ещё*?"
 ```
 
 Или через Compose — с возможностью убрать всё одной командой:
 
 ```bash
+mkdir -p models lab
+export PUID="$(id -u)" PGID="$(id -g)"
 docker compose -f docker/docker-compose.yml build
+docker compose -f docker/docker-compose.yml run --rm lab fetch-model
 docker compose -f docker/docker-compose.yml run --rm lab list
+docker compose -f docker/docker-compose.yml run --rm lab \
+  palette -t "Хорошо, включаю свет в гостиной. Нужно ли мне сделать что-то *ещё*?"
+# Палитра для другого голоса:
+docker compose -f docker/docker-compose.yml run --rm lab \
+  palette -v kseniya -t "Хорошо, включаю свет в гостиной. Нужно ли мне сделать что-то *ещё*?"
+# Сравнить все встроенные голоса на одной фразе:
+docker compose -f docker/docker-compose.yml run --rm lab \
+  compare --voices aidar,baya,kseniya,eugene,xenia -t "Добрый вечер!"
 docker compose -f docker/docker-compose.yml down --rmi local -v   # удалить всё
 ```
+
+`PUID` и `PGID` нужны, чтобы контейнер создавал файлы с владельцем текущего
+пользователя, а не с фиксированным UID/GID `1000:1000`.
+Доступные голоса: `aidar`, `baya`, `kseniya`, `eugene`, `xenia`; параметр
+`-v` выбирает голос для `palette`, а `compare --voices` сравнивает несколько.
 
 Или без Docker, напрямую (быстрее для итераций):
 
