@@ -1,0 +1,22 @@
+[Unit]
+Description=BPI-W3 voice assistant: VAD-trigger loop with resident ASR
+# voiced владеет микрофоном: в один момент времени listens ONLY это устройство.
+# ASR и TTS резидентны — должны быть подняты раньше, иначе сегменты пойдут
+# файлами в spool без распознавания.
+After=ttsd.service asrd.service
+
+[Service]
+# Микрофон USB: plughw:5,0 (только USB 2.0 порт и только plughw - с hw:
+# устройство отдаёт 11025 Гц и VAD-пайплайн падает).
+ExecStart=%h/models/tts-venv/bin/python %h/bpi-w3-voice-assistant/scripts/voiced.py \
+  --device plughw:5,0 \
+  --spool-dir %h/.assistant/segments \
+  --pre-roll 1.5 \
+  --gain 4.0
+Environment=ASR_ADDR=127.0.0.1
+Environment=ASR_PORT=6006
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

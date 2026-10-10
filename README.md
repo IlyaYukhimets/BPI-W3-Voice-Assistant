@@ -40,6 +40,7 @@
 9. [Синтез речи (TTS)](docs/09-tts.md)
 10. [Настройка голоса и интонации](docs/10-voice-tuning.md)
 11. [Резидентные службы (TTS-воркер и ASR-сервер)](docs/11-daemon.md)
+12. [Триггер-цикл (микрофон -> VAD -> ASR)](docs/12-voiced.md)
 
 ## Быстрый старт
 
@@ -62,6 +63,8 @@ bash scripts/install-deps.sh
 # Резидентные службы: модель TTS и ASR в памяти, реплика за 0.2–0.5 с
 cp systemd/*.service ~/.config/systemd/user/ && systemctl --user daemon-reload
 systemctl --user enable --now ttsd asrd
+# Триггер-цикл: постоянно слушает микрофон, произнесённая фраза -> текст
+systemctl --user enable --now voiced
 ```
 
 ## Подбор голоса

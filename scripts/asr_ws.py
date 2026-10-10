@@ -56,6 +56,31 @@ def parse_result(raw: str) -> str:
     return raw
 
 
+def pcm16_to_float32(samples: bytes) -> bytes:
+    """int16-PCM (arecord/сегменты триггер-цикла) -> float32 для протокола.
+
+    Протокол offline-сервера несёт сэмплы float32 в [-1, 1]; сегменты VAD —
+    int16. Один раз конвертируем здесь, чтобы клиенты не плодили конверсии.
+    """
+    import numpy as np
+    return (np.frombuffer(samples, dtype=np.int16).astype(np.float32)
+            / 32768.0).tobytes()
+
+
+def gain_pcm16(samples: bytes, gain: float) -> bytes:
+    """Программный гейн для int16-PCM с насыщением по диапазону.
+
+    USB-микрофон платы отдаёт тихий сигнал: у silero на такой громкости
+    вероятности речи едут 0.2-0.7 и порог 0.5 не срабатывает (проверено
+    пробником на плате). Гейн до VAD и ASR ставит вероятности на рабочую
+    высоту; при близком голосе настрой под тишину--шёпот--громкость своей
+    комнаты (--gain 1..8), клиппинг при переборе хуже недоусиления.
+    """
+    import numpy as np
+    x = np.frombuffer(samples, dtype=np.int16).astype(np.float32) * gain
+    return np.clip(x, -32768, 32767).astype(np.int16).tobytes()
+
+
 async def recognize(payload: bytes, addr: str, port: int) -> str:
     """Отправить фреймы и получить одну строку результата."""
     import websockets

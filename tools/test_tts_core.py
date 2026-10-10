@@ -15,6 +15,7 @@
 import json
 import os
 import re
+import struct
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
@@ -328,6 +329,13 @@ def test_worker_protocol():
     eq(msg[:8], (16000).to_bytes(4, "little") + (8).to_bytes(4, "little"),
        "заголовок ASR-фрейма: rate (LE) и длина данных в байтах")
     eq(len(msg), 16, "фрейм = 8 байт заголовка + данные")
+    # int16 -> float32 для протокола: масштаб [-1, 1] и размер x2 на сэмпл.
+    f32 = asr_ws.pcm16_to_float32(struct.pack("<3h", 16384, 0, -16384))
+    eq(len(f32), 12, "float32: 4 байта на сэмпл")
+    vals = struct.unpack("<3f", f32)
+    eq(round(vals[0], 3), 0.5, "int16 верхняя половина -> ~0.5 float")
+    eq(vals[1], 0.0, "нуль остаётся нулём")
+    eq(round(vals[2], 3), -0.5, "нижняя половина -> ~-0.5 float")
     eq(asr_ws.parse_result('{"text": "Включить свет"}'), "Включить свет",
        "JSON-ответ ASR-сервера -> текст")
     eq(asr_ws.parse_result("Просто текст"), "Просто текст",
@@ -431,13 +439,160 @@ def test_worker_framing():
         pair1.close()
 
 
+def test_voiced_gate():
+    """Машина состояний триггер-цикла (SpeechGate) БЕЗ модели: вероятности
+    речи подставляются как callable.
+
+    Регрессия sherpa-vad-alsa: сегменты там начинаются прямо на пересечении
+    порога, из-за чего срезается НАЧАЛО фразы (проверено: «Включить свет» ->
+    «Свет в коридоре»). Здесь сегмент обязан содержать пре-ролл — аудио до
+    пересечения, взятое из кольцевого буфера. Каждое окно помечаем своим
+    содержимым и сверяем его попадание в сегмент.
+    """
+    import voiced
+
+    cfg = voiced.GateConfig(threshold=0.5, min_speech=0.25, min_silence=0.3,
+                            pre_roll=0.4, sample_rate=16000)
+    gate = voiced.SpeechGate(cfg, prob_fn=lambda w: PROBS[0])
+    wb = voiced.WINDOW_SAMPLES * 2
+    w = b"\x00\x00" * voiced.WINDOW_SAMPLES   # «безопасное» содержимое окна
+
+    # --- тишина до и после: сегмента быть не должно -----------------------
+    for i in range(20):
+        PROBS[0] = 0.0
+        true(gate.feed(w) is None, "тишина не порождает сегмент")
+
+    # --- речь (0.4 с) -> пауза: один сегмент, с пре-роллом и без хвоста ----
+    # Каждое окно помечаем своим номером в первых 2 байтах; prob задаётся
+    # В МОМЕНТ кормления (prob_fn читается на каждом feed).
+    feed_list = (
+        [(0.0, struct.pack("<h", i) + w[2:]) for i in range(12)]      # тишина 0.384 с
+        + [(1.0, struct.pack("<h", i) + w[2:]) for i in range(100, 114)]  # речь 0.448 с
+        + [(0.0, struct.pack("<h", i) + w[2:]) for i in range(40, 60)])   # тишина 0.64 с
+
+    got = None
+    for prob, cur in feed_list:
+        PROBS[0] = prob
+        r = gate.feed(cur)
+        if r is not None:
+            got = r
+    true(got is not None, "сегмент закрылся после паузы")
+    eq(got["index"], 0, "порядковый номер сегмента")
+
+    samples = got["samples"]
+    true(samples > 0, "сегмент не пустой")
+    pcm = got["pcm"]
+    # Пре-ролл: последние окна тишины ПЕРЕД началом речи обязаны быть внутри.
+    head_first = struct.unpack("<h", pcm[0:2])[0]
+    true(0 < head_first != 100, "сегмент начинается ДО начала речи (пре-ролл)")
+    # Хвост: последние окна тишины подрезаются — последний помеченный номер
+    # не из хвостовой тишины (40..59).
+    tail_last = struct.unpack("<h", pcm[-2:])[0]
+    true(not 40 <= tail_last < 59, "хвостовая тишина подрезана")
+
+    # Один разговорный «блок» -> ровно один сегмент...
+    got2 = None
+    PROBS[0] = 0.0
+    for i in range(30):
+        true(gate.feed(w) is None, "после сегмента фолс-триггеров нет")
+    # ...и следующя речь даёт следующий индекс.
+    for i in range(10):
+        PROBS[0] = 1.0
+        got3 = gate.feed(w)
+    for i in range(30):
+        PROBS[0] = 0.0
+        r = gate.feed(w)
+        if r is not None:
+            got2 = r
+    true(got3 is None and got2 is not None and got2["index"] == 1,
+         "вторые реплика/индекс: 1")
+
+    # --- короткий скачок вероятности < min_speech: НЕ сегмент -------------
+    gate2 = voiced.SpeechGate(cfg, prob_fn=lambda x: PROBS[1])
+    for i in range(40):
+        PROBS[1] = 0.0
+        true(gate2.feed(w) is None, "фолс-триггер 1")
+    for i in range(5):                        # 0.16 с < min_speech 0.25
+        PROBS[1] = 1.0
+        true(gate2.feed(w) is None, "короткий скачок не открывает сегмент")
+    for i in range(30):
+        PROBS[1] = 0.0
+        true(gate2.feed(w) is None, "после скачка сегмента нет")
+
+    # --- ограничение длинной реплики: разрез по max_speech ----------------
+    cfg2 = voiced.GateConfig(threshold=0.5, min_speech=0.1, min_silence=0.5,
+                             max_speech=1.0, pre_roll=0.2, sample_rate=16000)
+    gate3 = voiced.SpeechGate(cfg2, prob_fn=lambda x: PROBS[2])
+    closed = []
+    PROBS[2] = 0.0
+    for i in range(60):
+        r = gate3.feed(w)
+        if r:
+            closed.append(r)
+    PROBS[2] = 1.0
+    for i in range(200):                      # ~6.4 с непрерывной речи
+        r = gate3.feed(w)
+        if r:
+            closed.append(r)
+    true(len(closed) >= 2, "реплика длиннее max_speech разрезается (кусков >= 2)")
+    if len(closed) >= 2:
+        eq(closed[1]["index"], closed[0]["index"] + 1,
+           "индексы сегментов идут подряд")
+        for r in closed:
+            true(r["samples"] <= 1.5 * 16000, "кусок не сильно больше max_speech")
+
+    # --- РЕГРЕССИЯ sherpa-семантики: слабые окна НЕ сбрасывают кандидата ---
+    # Реальный механизм «Напомни»: первое слово даёт вероятности ниже порога
+    # (проверено пробником на плате: 0.2-0.4 при пороге 0.5). Кандидат,
+    # открытый на одном сильном окне, должен дожить до min_speech, собирая
+    # полосовые окна; последовательная логика его теряла.
+    cfg4 = voiced.GateConfig(threshold=0.5, min_speech=0.25, min_silence=0.3,
+                             pre_roll=0.4, sample_rate=16000)
+    gate4 = voiced.SpeechGate(cfg4, prob_fn=lambda x: PROBS[3])
+    PROBS[3] = 0.0
+    for i in range(20):
+        gate4.feed(w)
+    # 1 сильное окно открывает кандидата...
+    PROBS[3] = 0.7
+    gate4.feed(w)
+    # 7 полосовых окон (0.4; выше neg 0.35, ниже порога; 0.224 с)
+    PROBS[3] = 0.4
+    for i in range(7):
+        gate4.feed(w)
+    # ещё 8 сильных: всего кандидата >= 0.25 с -> сегмент открывается
+    PROBS[3] = 0.7
+    for i in range(8):
+        gate4.feed(w)
+    true(gate4._triggered, "кандидат дожил до min_speech через полосовые окна")
+    # закрытие на тишине для последующих фаз
+    PROBS[3] = 0.0
+    got5 = None
+    for i in range(30):
+        r = gate4.feed(w)
+        if r is not None:
+            got5 = r
+    true(got5 is not None, "сегмент со слабым началом закрылся")
+
+    # --- гейн PCM: масштаб с насыщением ---------------------------------- -
+    import asr_ws
+    src = struct.pack("<3h", 1000, -1000, 30000)
+    out = struct.unpack("<3h", asr_ws.gain_pcm16(src, 4.0))
+    eq(out[0], 4000, "гейн x4 масштабирует сигнал")
+    eq(out[1], -4000, "гейн симметричен")
+    eq(out[2], 32767, "насыщение по верхней границе int16")
+
+
+PROBS = [0.0, 0.0, 0.0, 0.0]
+
+
 def main() -> int:
     for fn in (test_time, test_numbers_units, test_temperature_percent, test_latin,
                test_real_world, test_check_text, test_ssml,
                test_sentence_split, test_pitch_contour_labels,
                test_humanize_question, test_question_split,
                test_accusative_detection, test_resolve_threads,
-               test_worker_protocol, test_worker_framing, test_mono_from_bytes):
+               test_worker_protocol, test_worker_framing, test_voiced_gate,
+               test_mono_from_bytes):
         fn()
 
     print(f"пройдено проверок: {PASSED}")
