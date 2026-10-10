@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 
 # --------------------------------------------------------------------------
 # Константы
@@ -754,19 +755,63 @@ def write_audio(mono, path: str, ogg: bool = True) -> list[str]:
     return made
 
 
-def play(path: str, device: str = DEFAULT_DEVICE, timeout: int = 180) -> int:
-    """Проигрывание через aplay. Колонка может быть выключена — это не ошибка
-    синтеза, поэтому возвращаем код: 0 ок, 3 ошибка ALSA, 4 нет aplay."""
-    import subprocess
+def read_worker_reply(sock: socket.socket, max_header: int = 1 << 20) -> tuple[dict, bytes]:
+    """Читает ответ воркера: "\n"-терминированную строку статуса и payload.
 
-    try:
-        subprocess.run(["aplay", "-q", "-D", device, path],
-                       check=True, capture_output=True, timeout=timeout)
-        return 0
-    except FileNotFoundError:
-        return 4
-    except Exception:
-        return 3
+    Сервер пишет СТРОКУ и payload ПОДРЯД в один поток, а float32-аудио
+    сплошь и рядом содержит байт 0x0a. Наивное «читать до \n» глотало кусок
+    payload в заголовок (клиент падал на json.loads) или вычитывал весь
+    payload в поисках конца строки и получал EOF, трактуя это как «воркер
+    закрыл соединение» — при полностью успешном ответе сервера (проверено
+    на плате: гонялся с synth'ом в фоне). Поэтому строку режем по ПЕРВОМУ
+    \n, а всё, что за ним, возвращаем как начало payload.
+    """
+    header = bytearray()
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise ValueError("соединение закрыто до конца статуса")
+        i = chunk.find(b"\n")
+        if i < 0:
+            header.extend(chunk)
+            if len(header) > max_header:
+                raise ValueError("статус длиннее лимита")
+            continue
+        header.extend(chunk[:i + 1])
+        tail = bytes(chunk[i + 1:])
+        break
+    resp = json.loads(bytes(header))
+    if not isinstance(resp, dict):
+        raise ValueError("статус — не объект")
+    return resp, tail
+
+
+def play(path: str, device: str = DEFAULT_DEVICE, timeout: int = 180) -> int:
+    """Проигрывание через aplay. Первый запуск после долгого простоя может
+    падать (PCM уходит в сон и просыпается не сразу) — поэтому одна повторная
+    попытка через 0.25 с. Возвращаем код: 0 ок, 3 ошибка ALSA, 4 нет aplay.
+    При провале обеих попыток показываем НАСТОЯЩИЙ stderr aplay: раньше было
+    «проверь... что файл стерео», при том что файл был стерео — а ошибку это
+    прятало."""
+    import subprocess
+    import sys
+    import time
+
+    last_err = ""
+    for attempt in range(2):
+        try:
+            subprocess.run(["aplay", "-q", "-D", device, path],
+                           check=True, capture_output=True, timeout=timeout)
+            return 0
+        except FileNotFoundError:
+            return 4
+        except Exception as e:
+            out = getattr(e, "stderr", None) or b""
+            last_err = out.decode(errors="replace").strip()[-300:]
+            if attempt == 0:
+                time.sleep(0.25)
+    print(f"[tts-core] aplay {device}: {last_err or 'без вывода'}", file=sys.stderr)
+    return 3
 
 
 # --------------------------------------------------------------------------

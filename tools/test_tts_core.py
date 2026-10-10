@@ -352,13 +352,84 @@ def test_mono_from_bytes():
         fail("mono_from_bytes(3 байта) должен давать ValueError")
 
 
+def test_worker_framing():
+    """Кадрирование ответа воркера: статус режется по ПЕРВОМУ \\n.
+
+    Регрессия реального сбоя: сервер пишет статус и payload ПОДРЯД, а
+    float32-аудио содержит байт 0x0a. Клиент, читавший «до \\n», под
+    нагрузкой получал статус+payload одним чанком и трактовал это то как
+    мусорный JSON, то как «воркер закрыл соединение» — рабочий ответ
+    выбрасывался, реплика шла холодным путём.
+    """
+    import socket
+
+    payload = bytes([0x0A, 0x00, 0xFF, 0x0A]) * 3   # 0x0a внутри аудио
+    status = b'{"ok": true, "samples": 3, "gen_s": 0.02, "threads": 4}\n'
+
+    # Случай 1: статус и payload пришли одним чанком (худший вариант).
+    pair1, pair2 = socket.socketpair()
+    try:
+        pair2.sendall(status + payload)
+        resp, tail = core.read_worker_reply(pair1)
+        eq(resp, {"ok": True, "samples": 3, "gen_s": 0.02, "threads": 4},
+           "статус разобран даже при склеенном чанке")
+        eq(tail, payload, "payload получен целиком и без искажений")
+    finally:
+        pair1.close()
+        pair2.close()
+
+    # Случай 2: статус и payload разнесены по чанкам (обычный вариант).
+    pair1, pair2 = socket.socketpair()
+    try:
+        pair2.sendall(status[:20])
+        pair2.sendall(status[20:] + payload)
+        resp, tail = core.read_worker_reply(pair1)
+        eq(resp["ok"], True, "статус из двух чанков")
+        eq(tail, payload, "payload после перенесённого статуса")
+    finally:
+        pair1.close()
+        pair2.close()
+
+    # Случай 3: экранированный "\n" (2 байта) в статусе не рвёт кадрирование —
+    # резать надо только НАСТОЯЩИЙ байт 0x0a. Строки собираем программно, чтобы
+    # не путать escape-последовательности с реальными байтами.
+    pair1, pair2 = socket.socketpair()
+    try:
+        esc = chr(92) + "n"                       # backslash + 'n', не перевод строки
+        wire = b'{"ok": false, "error": "line1' + esc.encode() \
+               + b'line2"}' + b"\n" + payload
+        pair2.sendall(wire)
+        resp, tail = core.read_worker_reply(pair1)
+        # json-экскейп \n на проводе декодируется в НАСТОЯЩИЙ перевод строки —
+        # и это нормально: кадрирование режет по сырому байту, а не по смыслу.
+        eq(resp.get("error"), "line1" + chr(10) + "line2",
+           "экранированный перенос внутри JSON-строки не обрывает статус")
+        eq(tail, payload, "payload после статуса с экранированным переносом")
+    finally:
+        pair1.close()
+        pair2.close()
+
+    # Случай 4: соединение закрыто до конца статуса -> ValueError (фолбэк).
+    pair1, pair2 = socket.socketpair()
+    try:
+        pair2.close()
+        try:
+            core.read_worker_reply(pair1)
+        except ValueError as e:
+            true("закрыто до конца" in str(e), "EOF до \\n -> ValueError")
+        else:
+            fail("обрыв соединения должен давать ValueError")
+    finally:
+        pair1.close()
+
+
 def main() -> int:
     for fn in (test_time, test_numbers_units, test_temperature_percent, test_latin,
                test_real_world, test_check_text, test_ssml,
                test_sentence_split, test_pitch_contour_labels,
                test_humanize_question, test_question_split,
                test_accusative_detection, test_resolve_threads,
-               test_worker_protocol, test_mono_from_bytes):
+               test_worker_protocol, test_worker_framing, test_mono_from_bytes):
         fn()
 
     print(f"пройдено проверок: {PASSED}")

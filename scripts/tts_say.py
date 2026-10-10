@@ -42,7 +42,6 @@ def daemon_synth(ssml: str, voice: str, connect_timeout: float = 0.5,
     Отказ должен быть БЫСТРЫМ: реплика не должна ждать мёртвый сокет, поэтому
     на подключение даётся 0.5 с и лишь после него — долгий таймаут на синтез.
     """
-    import json
     import socket
 
     path = core.worker_socket_path()
@@ -54,23 +53,33 @@ def daemon_synth(ssml: str, voice: str, connect_timeout: float = 0.5,
             s.connect(path)
             s.sendall(core.worker_request(voice, ssml))
             s.settimeout(wait_timeout)
-            line = bytearray()
-            while not line.endswith(b"\n"):
-                chunk = s.recv(65536)
-                if not chunk:
-                    return None
-                line.extend(chunk)
-            resp = json.loads(bytes(line))
+            # Кадрирование — в core.read_worker_reply: строка статуса режется
+            # по ПЕРВОМУ \n, всё, что за ней, — начало payload. Наивное чтение
+            # «до \n» глотало payload (0x0a в аудио) и валело рабочий ответ.
+            resp, tail = core.read_worker_reply(s)
             if not resp.get("ok") or "samples" not in resp:
+                print(f"[say] воркер ответил ошибкой: {resp.get('error', resp)}, "
+                      f"холодный путь", file=sys.stderr)
                 return None
-            data, need = bytearray(), resp["samples"] * 4
+            data, need = bytearray(tail), resp["samples"] * 4
+            if len(data) > need:
+                print(f"[say] воркер прислал лишние данные "
+                      f"({len(data)} > {need}), холодный путь", file=sys.stderr)
+                return None
             while len(data) < need:
                 chunk = s.recv(min(65536, need - len(data)))
                 if not chunk:
+                    print(f"[say] воркер оборвал аудиоданные ({len(data)}/{need}), "
+                          f"холодный путь", file=sys.stderr)
                     return None          # недогрузили — холодный путь надёжнее
                 data.extend(chunk)
             return bytes(data), resp
-    except (OSError, json.JSONDecodeError, ValueError):
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        # Причина отказа — в stderr. Молчаливый фолбэк скрывал и само падение:
+        # в прогоне один из запусков ушёл холодным путём, и это было не видно.
+        # Отсутствие сокета — норма (демон выключен), эту ситуацию молчим.
+        print(f"[say] воркер не ответил ({e.__class__.__name__}: {e}), холодный путь",
+              file=sys.stderr)
         return None
 
 
