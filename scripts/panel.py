@@ -327,8 +327,8 @@ def set_wake_tone(kind: str) -> dict:
     Бэкап обязателен: юнит запускает резидентную службу, и опечатка в нём
     оставила бы ассистента без звука и без объяснений.
     """
-    if kind not in assistant.WAKE_TONES:
-        return {"ok": False, "message": f"неизвестный сигнал: {kind}"}
+    if not assistant.cue_ok(kind):
+        return {"ok": False, "message": f"нет такого сигнала: {kind}"}
     try:
         with open(VOICED_UNIT, encoding="utf-8") as handle:
             before = handle.read()
@@ -452,9 +452,12 @@ def do_action(payload: dict, token: str) -> dict:
 
     if action == "tone":
         kind = str(payload.get("kind") or assistant.DEFAULT_WAKE_TONE)
-        if kind not in assistant.WAKE_TONES:
-            return {"ok": False, "message": f"неизвестный сигнал: {kind}"}
-        rc = assistant.beep(kind=kind)
+        if not assistant.cue_ok(kind):
+            return {"ok": False, "message": f"нет такого сигнала: {kind}"}
+        # Обрезка — как в цикле: слушаем ровно то, что будет играть ассистент.
+        rc = assistant.beep(kind=kind,
+                            seconds=float(payload.get("seconds")
+                                          or assistant.CUE_SECONDS))
         return {"ok": rc == 0,
                 "message": (f"сигнал «{kind}» проигран" if rc == 0
                             else f"сигнал «{kind}» не прозвучал (aplay rc={rc})")}
@@ -507,10 +510,15 @@ def state(token: str) -> dict:
                        if f.endswith(".md")),
         "actions": bool(token),
         "wake_phrases": wake_phrases(voiced_exec),
-        "tones": [{"kind": k, "label": assistant.WAKE_TONE_LABELS.get(k, k)}
-                  for k in assistant.WAKE_TONES],
+        "tones": ([{"kind": k, "label": assistant.WAKE_TONE_LABELS.get(k, k)}
+                   for k in assistant.WAKE_TONES]
+                  + [{"kind": path, "label": "файл · " + os.path.basename(path)}
+                     for path in assistant.cue_files()]),
         "tone": exec_option(voiced_exec, "--wake-tone",
                              assistant.DEFAULT_WAKE_TONE),
+        "cue_seconds": float(exec_option(voiced_exec, "--wake-cue-seconds",
+                                         str(assistant.CUE_SECONDS)) or
+                             assistant.CUE_SECONDS),
         "ts": time.strftime("%H:%M:%S"),
     }
 
@@ -734,6 +742,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') $('modal').c
 
 let wakeName = 'астра';        // из ExecStart: кнопка «сказать имя»
 let tonePicked = false;        // пользователь сам выбрал сигнал в списке
+let cueSeconds = 0.7;          // сколько играть от файла сигнала (из юнита)
 
 async function act(btn){
   const action = btn.dataset.act;
@@ -741,7 +750,7 @@ async function act(btn){
   if (action === 'restart') body.unit = btn.dataset.unit;
   if (action === 'say') body.text = $('phrase').value;
   if (action === 'say_name'){ body.action = 'say'; body.text = wakeName; }
-  if (action === 'tone') body.kind = $('tone').value;
+  if (action === 'tone'){ body.kind = $('tone').value; body.seconds = cueSeconds; }
   if (action === 'set_tone') body.kind = $('tone').value;
   btn.disabled = true;
   try {
@@ -860,6 +869,7 @@ async function tick(){
     if (!tonePicked) $('tone').value = d.tone;
     $('tone-cur').textContent = d.tone;
   }
+  if (d.cue_seconds) cueSeconds = d.cue_seconds;
   if ((d.wake_phrases||[]).length){
     wakeName = d.wake_phrases[0];
     const pretty = wakeName.charAt(0).toUpperCase() + wakeName.slice(1);

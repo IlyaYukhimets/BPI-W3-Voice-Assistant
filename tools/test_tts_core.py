@@ -640,6 +640,81 @@ def test_assistant_reply():
     eq(req["json"]["text"], "включить свет", "текст кладётся в тело запроса")
 
 
+def test_trim_cue():
+    """Обрезка файла сигнала: моно, нужная длина, приглушённые края."""
+    import numpy as np
+    import assistant
+
+    rate = 16000
+    wave = np.sin(2 * np.pi * 440 * np.arange(rate) / rate).astype("float32")
+    stereo = np.stack([wave, wave], axis=1)          # чужые записи часто стерео
+
+    cut = assistant.trim_cue(stereo, rate, 0.4)
+    eq(cut.ndim, 1, "стерео сведено в моно: колонка одна")
+    eq(len(cut), int(rate * 0.4), "запись обрезана до заданной длины")
+    true(abs(float(cut[0])) < 0.01 and abs(float(cut[-1])) < 0.01,
+         "края приглушены — иначе на обрезке слышен щелчок")
+    eq(round(float(np.max(np.abs(cut))), 2), assistant.PEAK_LEVEL,
+       "громкость выровнена по встроенным сигналам")
+
+    quiet = np.full(rate // 10, 0.1, dtype="float32")
+    kept = assistant.trim_cue(quiet, rate, 5.0)
+    eq(len(kept), len(quiet), "короткая запись остаётся целиком")
+    eq(round(float(np.max(np.abs(kept))), 2), 0.1,
+       "тихий сигнал не подтягивается вверх: иначе он станет громким")
+
+
+def test_cue_files():
+    """Свои сигналы: список для панели, поиск по имени, проверка на опечатку."""
+    import tempfile
+    import assistant
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for name in ("alice.ogg", "alice.wav", "beep.flac", "заметка.txt"):
+            with open(os.path.join(tmp, name), "wb") as handle:
+                handle.write(b"x")
+        found = [os.path.basename(path) for path in assistant.cue_files(tmp)]
+        eq(found, ["alice.ogg", "beep.flac"],
+           "один сигнал — один пункт списка (ogg вместо wav), тексты не в счёт")
+        true(assistant.cue_is_file("alice.ogg"),
+             "файл отличается от встроенного варианта")
+        true(not assistant.cue_is_file("bell"),
+             "встроенный вариант файлом не считается")
+        true(assistant.cue_source(os.path.join(tmp, "beep.flac")) is not None,
+             "путь к своему файлу принимается")
+        true(assistant.cue_ok("bell"), "встроенный вариант годится")
+        true(assistant.cue_ok(os.path.join(tmp, "beep.flac")),
+             "существующий файл годится")
+        true(not assistant.cue_ok(os.path.join(tmp, "нет-такого.ogg")),
+             "несуществующий файл не годится — цикл скажет об этом при старте")
+
+
+def test_cue_file_seconds():
+    """Длину файла берём из заголовка: длинную запись играем обрезанной."""
+    import tempfile
+    import types
+    import assistant
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "долгая.ogg")
+        with open(path, "wb") as handle:
+            handle.write(b"x")
+        fake = types.ModuleType("soundfile")
+        fake.info = lambda p: types.SimpleNamespace(duration=2.5)
+        real = sys.modules.get("soundfile")
+        sys.modules["soundfile"] = fake
+        try:
+            eq(assistant.tone_seconds(path, seconds=0.7), 0.7,
+               "длина сигнала-файла ограничена обрезкой")
+            eq(assistant.tone_seconds(path, seconds=5.0), 2.5,
+               "если запись короче отведённого — играем её целиком")
+        finally:
+            if real is None:
+                sys.modules.pop("soundfile", None)
+            else:
+                sys.modules["soundfile"] = real
+
+
 def test_voiced_constants():
     """Имена, к которым обращается цикл, должны существовать у своих модулей.
 
@@ -1041,6 +1116,7 @@ def main() -> int:
                test_accusative_detection, test_resolve_threads,
                test_worker_protocol, test_worker_framing,
                test_assistant_reply, test_mono_from_bytes,
+               test_trim_cue, test_cue_files, test_cue_file_seconds,
                test_voiced_constants, test_wake_tones, test_beep_plays_once,
                test_kws_grammar, test_kws_spotter,
                test_command_recorder,

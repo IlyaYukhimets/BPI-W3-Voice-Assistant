@@ -114,23 +114,133 @@ def wake_tone(kind: str = DEFAULT_WAKE_TONE, sample_rate: int = 16000):
     return (samples * (PEAK_LEVEL / peak)).astype(np.float32)
 
 
-def tone_seconds(kind: str = DEFAULT_WAKE_TONE, sample_rate: int = 16000) -> float:
+# Свои сигналы: сюда кладутся файлы (например, озвучка «Слушаю» из make-cue.py).
+# Сигналом может быть и встроенная отбивка, и готовый файл — цикл не различает.
+CUE_DIR = os.path.expanduser("~/.assistant/cues")
+CUE_SUFFIXES = (".ogg", ".wav", ".flac")
+CUE_SECONDS = 0.7            # до какой длины обрезать файл сигнала
+
+
+def cue_is_file(value: str) -> bool:
+    """`--wake-tone` — это встроенный вариант или файл (путь либо имя из каталога)? """
+    return value not in WAKE_TONES
+
+
+def cue_files(directory: str = CUE_DIR) -> list[str]:
+    """Файлы сигналов из каталога. Одно имя — один сигнал, формат не дублируем."""
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    seen, found = set(), []
+    for name in names:
+        stem, suffix = os.path.splitext(name)
+        if suffix.lower() not in CUE_SUFFIXES or stem in seen:
+            continue
+        seen.add(stem)
+        found.append(os.path.join(directory, name))
+    return found
+
+
+def cue_source(value: str) -> str | None:
+    """Путь к файлу сигнала: как задан или найденный в каталоге сигналов."""
+    if not cue_is_file(value):
+        return None
+    path = os.path.expanduser(value)
+    if os.path.isfile(path):
+        return path
+    candidate = os.path.join(os.path.expanduser(CUE_DIR), value)
+    return candidate if os.path.isfile(candidate) else None
+
+
+def cue_ok(value: str) -> bool:
+    """Годится ли значение `--wake-tone`: встроенный вариант или существующий файл."""
+    return value in WAKE_TONES or cue_source(value) is not None
+
+
+def trim_cue(data, rate: int, seconds: float = CUE_SECONDS):
+    """Обрезать сигнал до нужной длины и убрать щелчки по краям.
+
+    Чистая функция: на входе массив из soundfile (моно или стерео, любой формат),
+    на выходе моно нужной длины. Файлы чужих записей всегда начинаются и
+    заканчиваются щелчком, а играем мы в колонку на полной громкости, поэтому
+    края приглушаются, а громкость выравнивается по встроенным вариантам.
+    """
+    import numpy as np
+
+    samples = np.asarray(data, dtype="float32")
+    if samples.ndim > 1:                      # колонка одна: стерео сводим в моно
+        samples = samples.mean(axis=1)
+    keep = min(len(samples), max(1, int(rate * seconds)))
+    samples = samples[:keep].copy()
+    fade_in = min(int(rate * 0.005), keep)
+    fade_out = min(int(rate * 0.03), keep)
+    if fade_in:
+        samples[:fade_in] *= np.linspace(0.0, 1.0, fade_in, dtype="float32")
+    if fade_out:
+        samples[-fade_out:] *= np.linspace(1.0, 0.0, fade_out, dtype="float32")
+    peak = float(np.max(np.abs(samples))) or 1.0
+    if peak > PEAK_LEVEL:                    # громкость как у встроенных сигналов
+        samples = samples * (PEAK_LEVEL / peak)
+    return samples
+
+
+def prepare_cue(value: str = DEFAULT_WAKE_TONE, seconds: float = CUE_SECONDS,
+                path: str | None = None) -> float:
+    """Готовит сигнал к проигрышу и возвращает его длину в секундах.
+
+    Встроенный вариант синтезируется, файл — читается, обрезается и получает
+    спады по краям. Исходник не трогаем: обрезанная копия уходит в
+    ~/.assistant/wake.wav, а сам файл остаётся как есть (его можно заменить и
+    слушать заново).
+    """
+    import tts_core as core
+
+    prepared = path or os.path.join(os.path.expanduser("~/.assistant"), "wake.wav")
+    os.makedirs(os.path.dirname(prepared), exist_ok=True)
+    source = cue_source(value)
+    if source is None:
+        samples = wake_tone(value)           # на опечатке бросит ValueError
+        core.write_audio(samples, prepared, ogg=False)
+        return len(samples) / core.SR
+
+    import soundfile as sf
+
+    data, rate = sf.read(source, always_2d=True)
+    samples = trim_cue(data, rate, seconds)
+    sf.write(prepared, samples, rate, subtype="PCM_16")
+    return len(samples) / rate
+
+
+def tone_seconds(kind: str = DEFAULT_WAKE_TONE, sample_rate: int = 16000,
+                 seconds: float = CUE_SECONDS) -> float:
     """Длительность сигнала: по ней цикл выкидывает звук сигнала из записи.
 
     Считаем из самого сигнала, а не держим в цикле второе магическое число:
     иначе длина отбивки и число выбрасываемых кадров надо согласовывать руками,
     а рассогласование кладёт тон внутрь записи команды.
     """
-    return len(wake_tone(kind, sample_rate)) / sample_rate
+    source = cue_source(kind)
+    if source is None:
+        return len(wake_tone(kind, sample_rate)) / sample_rate
+    import soundfile as sf
+
+    # Длину берём из заголовка, не читая файл целиком: если запись длиннее
+    # отведённого, играть будет ровно обрезанную часть.
+    return min(sf.info(source).duration, seconds)
 
 
-def beep(device: str | None = None, kind: str = DEFAULT_WAKE_TONE) -> int:
+def beep(device: str | None = None, kind: str = DEFAULT_WAKE_TONE,
+         seconds: float = CUE_SECONDS) -> int:
     """Короткий сигнал пробуждения — ТОН, а не слово.
 
     Говорить «слушаю» нельзя: пока ассистент говорит, микрофон заглушён, и
     начало команды потерялось бы. Сам сигнал в запись не попадает: цикл ждёт
     его окончания и выбрасывает ровно его длину (tone_seconds), поэтому мьют для
     сигнала не нужен.
+
+    Сигналом может быть встроенная отбивка или готовый файл (озвучка, .ogg):
+    файл читается, обрезается до `seconds` и получает спады по краям.
 
     Попытка ровно одна, повторов нет. Провальный aplay звука не даёт, зато
     занимает время, и отложенный сигнал приходит ровно тогда, когда колонка уже
@@ -143,8 +253,7 @@ def beep(device: str | None = None, kind: str = DEFAULT_WAKE_TONE) -> int:
     import tts_core as core
 
     path = os.path.join(os.path.expanduser("~/.assistant"), "wake.wav")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    core.write_audio(wake_tone(kind), path, ogg=False)
+    prepare_cue(kind, seconds, path)
     return core.play(path, device=device or core.DEFAULT_DEVICE, timeout=10)
 def make_reply(text: str, template: str = DEFAULT_TEMPLATE) -> str:
     """Реплика ассистента на распознанный текст.

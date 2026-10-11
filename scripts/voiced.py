@@ -226,10 +226,14 @@ def main() -> int:
     ap.add_argument("--keep", type=int, default=20,
                     help="сколько сегментов хранить в spool")
     ap.add_argument("--wake-tone", default=assistant.DEFAULT_WAKE_TONE,
-                    choices=list(assistant.WAKE_TONES),
-                    help="какой сигнал играть после имени (chime — две ноты, "
-                         "blip — скользящий, soft — мягкая нота, tone — прежний "
-                         "тон 880 Гц)")
+                    help="сигнал после имени: встроенная отбивка ("
+                         + ", ".join(assistant.WAKE_TONES) + ") или файл — имя "
+                         "из " + assistant.CUE_DIR + " либо путь (тогда запись "
+                         "обрезается до --wake-cue-seconds)")
+    ap.add_argument("--wake-cue-seconds", type=float,
+                    default=assistant.CUE_SECONDS,
+                    help="сколько играть от файла сигнала (встроенные отбивки "
+                         "короче и обрезаются сами)")
     ap.add_argument("--no-wake-beep", action="store_true",
                     help="не играть сигнал после имени")
     ap.add_argument("--beep-tail-frames", type=int, default=6,
@@ -269,6 +273,12 @@ def main() -> int:
 
     # Модель грузим сразу: без неё цикл бессмысленен, и падать лучше на старте
     # (systemd покажет причину в журнале), чем посреди работы.
+    if not assistant.cue_ok(args.wake_tone):
+        print(f"сигнал {args.wake_tone!r} не годится: нет ни такого файла, ни "
+              f"встроенного варианта ({', '.join(assistant.WAKE_TONES)}), "
+              f"свои файлы кладутся в {assistant.CUE_DIR}", file=sys.stderr)
+        return 2
+
     spot = kws.KwsSpotter(model_dir=args.kws_model, phrases=phrases)
     try:
         spot.load()
@@ -366,7 +376,8 @@ def main() -> int:
                     # 1.5 — терялось «Включи»).
                     drain()
                     if not args.no_wake_beep:
-                        rc = assistant.beep(kind=args.wake_tone)
+                        rc = assistant.beep(kind=args.wake_tone,
+                                            seconds=args.wake_cue_seconds)
                         if rc != 0:
                             print(f"[kws] сигнал не проигрался (aplay rc={rc})",
                                   flush=True)
@@ -377,7 +388,9 @@ def main() -> int:
                     # записи команды. Флаг --beep-tail-frames остаётся нижней
                     # границей (запас на медленный старт aplay).
                     tail = max(args.beep_tail_frames, math.ceil(
-                        (assistant.tone_seconds(args.wake_tone) + 0.12)
+                        (assistant.tone_seconds(
+                            args.wake_tone,
+                            seconds=args.wake_cue_seconds) + 0.12)
                         * SAMPLE_RATE / FRAME))
                     for _ in range(tail):
                         if read_frame() is None:
