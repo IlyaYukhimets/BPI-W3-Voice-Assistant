@@ -369,6 +369,12 @@ def check_token(given: str | None, expected: str) -> str:
     return "denied"
 
 
+def name_from_unit() -> str:
+    """Имя ассистента из настроек юнита — то, что реально настроено."""
+    return wake_phrases(exec_from_cat(run(["systemctl", "--user", "cat",
+                                           "voiced"])))[0]
+
+
 def do_action(payload: dict, token: str) -> dict:
     """Выполнить действие из панели. Возвращает {ok, message}."""
     action = payload.get("action")
@@ -378,8 +384,10 @@ def do_action(payload: dict, token: str) -> dict:
             return {"ok": False, "message": f"неизвестная служба: {unit}"}
         out = run(["systemctl", "--user", "restart", unit], timeout=20)
         return {"ok": True, "message": f"{unit}: перезапуск отправлен"}
-    if action == "say":
+    if action in ("say", "say_name"):
         text = str(payload.get("text", ""))[:200].strip()
+        if action == "say_name" and not text:
+            text = name_from_unit()          # кнопка «сказать имя»
         if not text:
             return {"ok": False, "message": "пустой текст"}
         # Список аргументов, без shell: текст не может стать командой.
@@ -642,7 +650,7 @@ async function act(btn){
   const body = {action};
   if (action === 'restart') body.unit = btn.dataset.unit;
   if (action === 'say') body.text = $('phrase').value;
-  if (action === 'say_name') body.text = wakeName;
+  if (action === 'say_name'){ body.action = 'say'; body.text = wakeName; }
   btn.disabled = true;
   try {
     const r = await fetch('/api/action', {method:'POST',
