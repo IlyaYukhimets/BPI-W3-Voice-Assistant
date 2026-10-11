@@ -882,6 +882,26 @@ def test_panel_parse():
     true("астра" in steps[1]["detail"], "формы имени видны в схеме")
     eq(steps[0]["state"], "bad", "упавшая служба красит ступень схемы")
 
+    # ExecStart в юнитах разбит переносами: читать только первую строку —
+    # значит потерять все настройки (так схема показывала умолчания).
+    unit = ("[Service]\n"
+            "ExecStart=%h/venv/bin/python %h/repo/scripts/voiced.py \\\n"
+            "  --device plughw:5,0 \\\n"
+            '  --kws-phrases "астра,астры,эй астра" \\\n'
+            "  --spool-dir %h/.assistant/segments\n"
+            "Restart=on-failure\n")
+    joined = panel.exec_from_cat(unit)
+    true("--device plughw:5,0" in joined, "перенос строки склеен: устройство видно")
+    true("эй астра" in joined, "формы имени из ExecStart целиком")
+    eq(panel.exec_from_cat("[Service]\nRestart=on-failure\n"), "",
+       "без ExecStart пусто, без исключений")
+
+    # Формы имени берутся из ExecStart: по ним схема и кнопка «сказать имя».
+    eq(panel.wake_phrases('--device plughw:5,0 --kws-phrases "астра,астры,эй астра"'),
+       ["астра", "астры", "эй астра"], "формы имени читаются из ExecStart юнита")
+    eq(panel.wake_phrases("--device plughw:5,0"), ["астра"],
+       "без флага остаётся значение по умолчанию")
+
     # Документы: имя проверяется, иначе панель отдавала бы что угодно с диска.
     true(panel.doc_path("13-kws.md") is not None, "документ по имени находится")
     eq(panel.doc_path("../etc/passwd"), None, "выход из каталога отсекается")

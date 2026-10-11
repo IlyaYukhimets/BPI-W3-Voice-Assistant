@@ -82,6 +82,27 @@ def rss_mb(pid: str) -> float | None:
     return None
 
 
+def exec_from_cat(text: str) -> str:
+    """ExecStart из `systemctl cat`, склеенный по переносам строк.
+
+    В юнитах команда почти всегда разбита через «\\» (у нас — пять строк).
+    Если читать только первую строку, все настройки теряются: схема показывала
+    умолчания вместо реального устройства и форм имени, а кнопка «сказать имя»
+    не знала, как зовут ассистента.
+    """
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not line.startswith("ExecStart="):
+            continue
+        parts = [line.split("=", 1)[1].strip()]
+        while parts[-1].endswith("\\") and index + 1 < len(lines):
+            parts[-1] = parts[-1][:-1].rstrip()
+            index += 1
+            parts.append(lines[index].strip())
+        return " ".join(part for part in parts if part)
+    return ""
+
+
 def units_state(names=UNITS) -> list[dict]:
     result = []
     for name in names:
@@ -89,10 +110,7 @@ def units_state(names=UNITS) -> list[dict]:
                                 "-p", "ActiveState,SubState,MainPID,"
                                       "ExecMainStartTimestamp,NRestarts", name]))
         pid = props.get("MainPID", "0")
-        exec_line = ""
-        for line in run(["systemctl", "--user", "cat", name]).splitlines():
-            if line.startswith("ExecStart="):
-                exec_line = line.split("=", 1)[1].strip()
+        exec_line = exec_from_cat(run(["systemctl", "--user", "cat", name]))
         result.append({
             "name": name,
             "active": props.get("ActiveState", "unknown"),
@@ -279,19 +297,26 @@ def host_info() -> dict:
     return info
 
 
+def wake_phrases(exec_line: str) -> list[str]:
+    """Формы имени из ExecStart юнита: нужны схеме и кнопке «сказать имя»."""
+    match = re.search(r"--kws-phrases\s+\"?([^\"\\]+)\"?", exec_line or "")
+    if not match:
+        return ["астра"]
+    return [p.strip() for p in match.group(1).split(",") if p.strip()]
+
+
 def pipeline(units: list[dict], kws_stats: dict) -> list[dict]:
     """Схема тракта с живым состоянием на каждой ступени."""
     by_name = {u["name"]: u for u in units}
     voiced = by_name.get("voiced", {})
     options = voiced.get("exec", "")
     mic = re.search(r"--device (\S+)", options)
-    phrases = re.search(r"--kws-phrases \"?([^\"\\]+)\"?", options)
+    phrases = wake_phrases(options)
     return [
         {"stage": "Микрофон", "detail": mic.group(1) if mic else "plughw:5,0",
          "state": "ok" if voiced.get("active") == "active" else "bad"},
         {"stage": "Vosk-KWS (имя)",
-         "detail": (phrases.group(1) if phrases else "астра").strip() +
-                   f"; срабатываний {kws_stats.get('hits', 0)}",
+         "detail": ", ".join(phrases) + f"; срабатываний {kws_stats.get('hits', 0)}",
          "state": "ok" if kws_stats.get("hits") else "wait"},
         {"stage": "Сигнал", "detail": "тон 880 Гц, 0.12 с", "state": "ok"},
         {"stage": "Запись команды", "detail": "энергетический детектор",
@@ -397,6 +422,8 @@ def state(token: str) -> dict:
         "docs": sorted(f for f in os.listdir(os.path.join(REPO, "docs"))
                        if f.endswith(".md")),
         "actions": bool(token),
+        "wake_phrases": wake_phrases(next((u["exec"] for u in units
+                                           if u["name"] == "voiced"), "")),
         "ts": time.strftime("%H:%M:%S"),
     }
 
@@ -415,11 +442,27 @@ align-items:center;flex-wrap:wrap;position:sticky;top:0;background:var(--bg);z-i
 h1{font-size:16px;margin:0;font-weight:600}
 h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);
 margin:0 0 10px;display:flex;gap:8px;align-items:center}
-main{padding:18px 20px;display:grid;gap:16px;
-grid-template-columns:repeat(auto-fit,minmax(330px,1fr));align-items:start}
+/* Компоновка нарочно не авто-адаптивная: при repeat(auto-fit) блоки
+   разной высоты оставляли дыры. Здесь фиксированная двухколоночная схема по
+   смыслу: слева «что происходит», справа «чем управлять», снизу на всю ширину
+   журналы и документы. */
+main{padding:16px 20px;display:flex;flex-direction:column;gap:14px}
+.cols{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,1fr);gap:14px;
+align-items:start}
+.col{display:flex;flex-direction:column;gap:14px;min-width:0}
+@media(max-width:1000px){.cols{grid-template-columns:1fr}}
 section{background:var(--card);border:1px solid var(--line);border-radius:10px;
 padding:14px 16px;min-width:0}
-.wide{grid-column:1/-1}
+textarea{width:100%;background:#232a33;border:1px solid var(--line);color:var(--fg);
+border-radius:6px;padding:8px 10px;font:13px/1.45 system-ui;resize:vertical;
+min-height:56px}
+.btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.hint{color:var(--dim);font-size:11.5px;margin-top:8px;line-height:1.45}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{border:1px solid var(--line);border-radius:12px;padding:2px 9px;font-size:12px;
+cursor:pointer;color:#9db6d8}
+.chip:hover{border-color:#3d4753;color:#cfe0f5}
+.retry{padding:1px 7px;font-size:12px;line-height:1.35}
 .logs{display:grid;gap:12px;grid-template-columns:repeat(3,minmax(0,1fr))}
 @media(max-width:900px){.logs{grid-template-columns:1fr}}
 .pipe{display:flex;flex-wrap:wrap;gap:6px;align-items:stretch}
@@ -481,31 +524,36 @@ font-size:13px;display:none;z-index:30}
   placeholder="для действий"></span>
 </header>
 <main>
-<section class="wide"><h2>Схема тракта</h2><div class="pipe" id="pipe"></div></section>
-<section><h2>Службы</h2><table id="units"></table></section>
-<section><h2>Уровни фраз</h2><svg id="chart" width="100%" height="120"
-  viewBox="0 0 400 120" preserveAspectRatio="none"></svg>
-  <div class="dim mono" id="chart-note" style="font-size:11.5px"></div></section>
-<section><h2>Последние фразы</h2><table id="segments"></table></section>
-<section><h2>Действия <span id="act-state" class="dim"></span></h2>
-  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-    <button class="act" data-act="restart" data-unit="voiced">перезапустить voiced</button>
-    <button class="act" data-act="restart" data-unit="asrd">asrd</button>
-    <button class="act" data-act="restart" data-unit="ttsd">ttsd</button>
+<section><h2>Схема тракта</h2><div class="pipe" id="pipe"></div></section>
+<div class="cols">
+  <div class="col">
+    <section><h2>Уровни фраз</h2>
+      <svg id="chart" width="100%" height="150" viewBox="0 0 400 150"
+        preserveAspectRatio="none"></svg>
+      <div class="hint" id="chart-note"></div></section>
+    <section><h2>Последние фразы</h2><table id="segments"></table></section>
+    <section><h2>KWS и пропуски</h2><pre id="kws"></pre></section>
   </div>
-  <div style="display:flex;gap:8px;margin-top:8px">
-    <input id="phrase" placeholder="фраза для теста озвучки"
-      style="flex:1;background:#232a33;border:1px solid var(--line);color:var(--fg);
-      border-radius:6px;padding:4px 8px;font-size:12px">
-    <button class="act" data-act="say">сказать</button>
-    <button class="act" data-act="asr">ASR по последнему</button>
+  <div class="col">
+    <section><h2>Службы</h2><table id="units"></table>
+      <div class="hint">⟳ — перезапуск службы (нужен ключ)</div></section>
+    <section><h2>Действия <span id="act-state" class="dim"
+      style="text-transform:none;letter-spacing:0"></span></h2>
+      <textarea id="phrase" placeholder="фраза для теста озвучки — Enter, чтобы
+        сказать (Shift+Enter — перенос строки)"></textarea>
+      <div class="btns">
+        <button class="act" data-act="say">сказать</button>
+        <button class="act" data-act="say_name">сказать имя</button>
+        <button class="act" data-act="asr">ASR по последнему</button>
+      </div>
+      <div class="hint">«Сказать имя» выводит на колонку имя ассистента: он
+        услышит себя через микрофон, сработает KWS и даст сигнал — это сквозная
+        проверка тракта (микрофон → сторож имени → сигнал).</div></section>
+    <section><h2>Модели</h2><table id="models"></table></section>
+    <section><h2>Файлы сегментов</h2><table id="spool"></table></section>
   </div>
-  <div class="dim" style="font-size:11.5px;margin-top:6px">Действия требуют ключа
-  (файл ~/.assistant/panel.token)</div></section>
-<section><h2>Модели</h2><table id="models"></table></section>
-<section><h2>Файлы сегментов</h2><table id="spool"></table></section>
-<section><h2>KWS и пропуски</h2><pre id="kws"></pre></section>
-<section class="wide"><h2>Журналы</h2>
+</div>
+<section><h2>Журналы</h2>
   <div class="logs">
     <div><div class="dim mono" style="font-size:11.5px;margin-bottom:4px">voiced</div>
       <pre id="log-voiced"></pre></div>
@@ -514,7 +562,7 @@ font-size:13px;display:none;z-index:30}
     <div><div class="dim mono" style="font-size:11.5px;margin-bottom:4px">ttsd</div>
       <pre id="log-ttsd"></pre></div>
   </div></section>
-<section><h2>Документы</h2><div id="docs"></div></section>
+<section><h2>Документы</h2><div class="chips" id="docs"></div></section>
 </main>
 <div id="modal"><div id="doc"><span class="close">✕ закрыть</span><div id="doc-body"></div></div></div>
 <div id="note"></div>
@@ -587,11 +635,14 @@ $('modal').addEventListener('click', e => { if (e.target.id === 'modal') $('moda
 document.querySelector('#doc .close').addEventListener('click', () => $('modal').classList.remove('on'));
 document.addEventListener('keydown', e => { if (e.key === 'Escape') $('modal').classList.remove('on'); });
 
+let wakeName = 'астра';        // из ExecStart: кнопка «сказать имя»
+
 async function act(btn){
   const action = btn.dataset.act;
   const body = {action};
   if (action === 'restart') body.unit = btn.dataset.unit;
   if (action === 'say') body.text = $('phrase').value;
+  if (action === 'say_name') body.text = wakeName;
   btn.disabled = true;
   try {
     const r = await fetch('/api/action', {method:'POST',
@@ -604,6 +655,9 @@ async function act(btn){
   tick();
 }
 document.addEventListener('click', e => { if (e.target.classList.contains('act')) act(e.target); });
+$('phrase').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); act({dataset:{act:'say'}}); }
+});
 
 function drawChart(hist){
   const svg = $('chart');
@@ -642,12 +696,13 @@ async function tick(){
     (i ? '<div class="arrow">→</div>' : '') +
     `<div class="step ${p.state}"><b>${esc(p.stage)}</b><span>${esc(p.detail)}</span></div>`
   ).join('');
-  $('units').innerHTML = '<tr><th>служба</th><th>состояние</th><th>PID</th><th>RSS</th>'
-    + '<th>рестартов</th></tr>' + (d.units||[]).map(u =>
+  $('units').innerHTML = '<tr><th>служба</th><th>состояние</th><th>PID</th>'
+    + '<th>RSS</th><th>⟳</th></tr>' + (d.units||[]).map(u =>
     `<tr><td class="mono">${esc(u.name)}</td><td><span class="tag
     ${u.active==='active'?'ok':'bad'}">${esc(u.active)}</span></td>
     <td class="mono">${u.pid||'-'}</td><td class="mono">${u.rss_mb?u.rss_mb+' МБ':'-'}</td>
-    <td class="mono">${u.restarts}</td></tr>`).join('');
+    <td><button class="act retry" data-act="restart" data-unit="${esc(u.name)}"
+    title="перезапустить">⟳</button></td></tr>`).join('');
   drawChart(d.history);
   $('chart-note').textContent = `точки: ${(d.history||[]).length} · зелёная — фраза
     распознана, жёлтая — нет · по вертикали пик, дБ (-60…0)`;
@@ -689,13 +744,19 @@ async function tick(){
     }).join('');
   }
   $('docs').innerHTML = (d.docs||[]).map(f =>
-    `<span class="doclink" data-doc="${esc(f)}">📄 ${esc(f)}</span>`).join('');
+    `<span class="chip" data-doc="${esc(f)}">${esc(f.replace(/\.md$/, ''))}</span>`
+  ).join('');
+  if ((d.wake_phrases||[]).length){
+    wakeName = d.wake_phrases[0];
+    const pretty = wakeName.charAt(0).toUpperCase() + wakeName.slice(1);
+    document.querySelector('[data-act="say_name"]').textContent = `сказать «${pretty}»`;
+  }
   const enabled = !!d.actions;
   $('act-state').textContent = enabled ? '(ключ есть)' : '(только чтение)';
   document.querySelectorAll('.act').forEach(b => { b.disabled = !enabled; });
 }
 document.addEventListener('click', e => {
-  const t = e.target.closest('.doclink');
+  const t = e.target.closest('.chip');
   if (t) openDoc(t.dataset.doc);
 });
 tick(); setInterval(tick, 3000);
