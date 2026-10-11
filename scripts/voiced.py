@@ -244,6 +244,10 @@ def main() -> int:
                     help="во сколько раз кадр должен быть громче шума, чтобы "
                          "считать его началом команды. 2.5 требовало почти "
                          "крика в микрофон — с расстояния запись не начиналась")
+    ap.add_argument("--min-command-speech", type=float, default=0.25,
+                    help="сколько речи (с) должно быть в записи, чтобы считать "
+                         "её командой: шумовые сегменты дают 0-0.06 с и раньше "
+                         "превращались в ответы-галлюцинации")
     ap.add_argument("--no-asr", action="store_true",
                     help="только писать сегменты в spool (для отладки)")
     ap.add_argument("--no-reply", action="store_true",
@@ -303,7 +307,7 @@ def main() -> int:
     recorder: CommandRecorder | None = None
     noise_hist: deque[float] = deque(maxlen=62)   # ~2 с: из них берём пол
     pre_roll: deque[bytes] = deque(maxlen=16)     # 0.5 с перед командой
-    level_hist: deque[float] = deque(maxlen=94)   # 3 с: громкость имени
+    level_hist: deque[float] = deque(maxlen=156)  # 5 с: громкость имени
     floor_rms = 0.0          # шумовой пол (20-й процентиль истории)
     counter = 0
 
@@ -406,6 +410,13 @@ def main() -> int:
                     pass
             print(f"[seg] {counter}: {dur:.2f}с, речь {got['speech_s']:.2f}с, "
                   f"пик {peak_db(got['pcm']):.0f} дБ ({got['status']})", flush=True)
+            if got["speech_s"] < args.min_command_speech:
+                # Сегмент открылся, но речи в нём почти нет: так шум комнаты
+                # после срабатывания давал ответы-галлюцинации («Принято: Я»).
+                # Запись оставляем в spool для разбора, распознавание не зовём.
+                print(f"[kws] в записи почти нет речи ({got['speech_s']:.2f} с) — "
+                      f"похоже на шум, пропускаю", flush=True)
+                continue
             if args.no_asr:
                 continue
 

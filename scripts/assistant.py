@@ -35,19 +35,42 @@ def wake_tone(sample_rate: int = 16000, freq: float = 880.0,
     return (np.sin(2 * np.pi * freq * t) * env * amp).astype(np.float32)
 
 
-def beep(device: str | None = None) -> int:
+def beep(device: str | None = None, attempts: int = 3, pause: float = 0.15,
+         play=None) -> int:
     """Короткий сигнал пробуждения — ТОН, а не слово.
 
     Говорить «слушаю» нельзя: пока ассистент говорит, микрофон заглушён, и
-    начало команды потерялось бы. 0.12 с тона в сегмент VAD не попадут
-    (min_speech 0.25 с), поэтому мьют для сигнала не нужен.
+    начало команды потерялось бы. 0.12 с тона в запись команды не попадают
+    (детектор стартует по трём кадрам), поэтому мьют для сигнала не нужен.
+
+    ПОВТОРЫ. Колонка одна, и aplay может получить «Device or resource busy» —
+    например, пока предыдущий aplay ещё не отдал устройство. Три попытки с
+    паузой (суммарно ~0.3 с) закрывают ровно эту короткую занятость.
+    Длинную занятость они НЕ закрывают и не должны: если через колонку играет
+    что-то большое (например, фразу проигрывает сам пользователь), ждать
+    бессмысленно — звук на устройстве и есть его источник. Тогда код ошибки
+    уходит в журнал, где панель подсвечивает его красным.
     """
-    import tts_core as core
+    import time
 
     path = os.path.join(os.path.expanduser("~/.assistant"), "wake.wav")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    core.write_audio(wake_tone(), path, ogg=False)
-    return core.play(path, device=device or core.DEFAULT_DEVICE, timeout=10)
+    if play is None:
+        import tts_core as core
+
+        def play(path, device=None):
+            return core.play(path, device=device or core.DEFAULT_DEVICE, timeout=10)
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        core.write_audio(wake_tone(), path, ogg=False)
+
+    rc = 1
+    for attempt in range(max(1, attempts)):
+        rc = play(path, device=device)
+        if rc == 0:
+            return 0
+        if attempt + 1 < attempts:
+            time.sleep(pause)
+    return rc
 
 
 def make_reply(text: str, template: str = DEFAULT_TEMPLATE) -> str:

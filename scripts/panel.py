@@ -621,9 +621,13 @@ function drawChart(hist){
       fill="${p.text ? '#3ecf8e' : '#e0a94a'}"><title>${esc(p.time)} · ${p.peak} дБ ·
       ${esc(p.text || 'не расслышал')}</title></circle>`;
   });
-  svg.innerHTML = `<line x1="0" y1="${y(0)}" x2="${w}" y2="${y(0)}" stroke="#2a313b"/>
-    <line x1="0" y1="${y(-60)}" x2="${w}" y2="${y(-60)}" stroke="#2a313b"/>
-    <path d="${line}" fill="none" stroke="#7fb3ff" stroke-width="1.4"/>${marks}`;
+  let grid = '';
+  for (const db of [0, -20, -40, -60]) {
+    grid += `<line x1="0" y1="${y(db)}" x2="${w}" y2="${y(db)}" stroke="#232a33"/>`
+      + `<text x="3" y="${y(db) - 2}" fill="#5c6675" font-size="9">${db} дБ</text>`;
+  }
+  svg.innerHTML = grid
+    + `<path d="${line}" fill="none" stroke="#7fb3ff" stroke-width="1.4"/>${marks}`;
 }
 
 async function tick(){

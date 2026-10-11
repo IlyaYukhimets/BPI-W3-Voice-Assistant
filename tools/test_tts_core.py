@@ -635,6 +635,31 @@ def test_assistant_reply():
     eq(req["json"]["text"], "включить свет", "текст кладётся в тело запроса")
 
 
+def test_beep_retry():
+    """Сигнал повторяется, если колонка занята нашей же озвучкой ответа."""
+    import assistant
+
+    calls = []
+
+    def flaky(path, device=None):
+        calls.append(device)
+        return 0 if len(calls) >= 3 else 3        # 3 = «Device or resource busy»
+
+    eq(assistant.beep(attempts=3, pause=0.0, play=flaky), 0,
+       "сигнал доигрывается с третьей попытки")
+    eq(len(calls), 3, "две неудачные попытки и одна успешная")
+
+    calls.clear()
+
+    def dead(path, device=None):
+        calls.append(device)
+        return 3
+
+    eq(assistant.beep(attempts=2, pause=0.0, play=dead), 3,
+       "если колонка так и занята — код ошибки уходит вызывающему")
+    eq(len(calls), 2, "попыток ровно столько, сколько задано")
+
+
 def test_kws_grammar():
     """Грамматика KWS: список наших форм + [unk] для всего остального."""
     import json
@@ -895,7 +920,8 @@ def main() -> int:
                test_accusative_detection, test_resolve_threads,
                test_worker_protocol, test_worker_framing,
                test_assistant_reply, test_mono_from_bytes,
-               test_kws_grammar, test_kws_spotter, test_command_recorder,
+               test_beep_retry, test_kws_grammar, test_kws_spotter,
+               test_command_recorder,
                test_panel_parse):
         fn()
 
