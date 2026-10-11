@@ -801,6 +801,63 @@ def test_command_recorder():
          "в шумной комнате команда закрывается по падению от пика речи")
 
 
+def test_panel_parse():
+    """Панель: разбор systemctl и журнала — чистые функции, без сервера."""
+    import panel
+
+    props = panel.parse_show("ActiveState=active\nSubState=running\n"
+                             "MainPID=143486\nNRestarts=2\n")
+    eq(props["ActiveState"], "active", "systemctl show разобран в словарь")
+    eq(props["MainPID"], "143486", "PID берётся из вывода systemctl")
+    eq(panel.rss_mb("0"), None, "нет процесса — нет памяти (без исключения)")
+
+    noisy = ("Oct 11 14:08:51 ubuntu python[143486]: [kws] услышал имя (318 кадров "
+             "прослушано, срабатываний 1, громкость имени -26 дБ)\n"
+             "Oct 11 14:08:51 ubuntu python[143486]: 2026-10-11 14:08:51 "
+             "[W:onnxruntime:Default, device_discovery.cc:164] GPU device "
+             "discovery failed\n"
+             "Oct 11 14:08:52 ubuntu systemd[812]: Started BPI-W3 voice assistant.\n"
+             "Oct 11 14:08:53 ubuntu python[143486]: LOG (VoskAPI:Model():model.cc:122)"
+             " Reading\n")
+    lines = panel.clean_lines(noisy)
+    eq(len(lines), 1, "служебный шум onnxruntime/Vosk/systemd выброшен")
+    true(lines[0].startswith("[kws]"), "строка события осталась, префикс снят")
+
+    journal = [
+        "[kws] услышал имя (318 кадров прослушано, срабатываний 1, "
+        "громкость имени -26 дБ)",
+        "[seg] 1: 2.27с, речь 0.35с, пик -20 дБ (ok)",
+        "1: Отсвет в коридоре.  [ASR 0.22 с]",
+        "[reply] Принято: Отсвет в коридоре.",
+        "[kws] команды не последовало за 5 с (шум 394, громче всего 765, "
+        "порог 709)",
+        "[seg] 2: 1.31с, речь 0.00с, пик -28 дБ (ok)",
+        "[asr] 2: не расслышал (0.25 с, пик -28 дБ) — повторите",
+    ]
+    ev = panel.parse_events(journal)
+    eq(ev["kws"]["hits"], 1, "срабатывания имени посчитаны")
+    eq(ev["kws"]["frames"], 318, "кадры прослушивания учтены")
+    eq(ev["kws"]["name_db"], -26, "громкость имени прочитана")
+    eq(ev["kws"]["waited"], 1, "пропуск команды учтён")
+    eq(ev["kws"]["last_margin"]["threshold"], 709, "запас до порога показан")
+    eq(len(ev["segments"]), 2, "обе фразы попали в список")
+    first = ev["segments"][0]
+    eq(first["text"], "Отсвет в коридоре.", "текст привязан к своему сегменту")
+    eq(first["levels"]["peak"], -20, "уровень пика прочитан из [seg]")
+    true(ev["segments"][1].get("failed"), "неудача отмечена как «не расслышал»")
+    eq(ev["replies"][-1], "Принято: Отсвет в коридоре.", "ответ попал в список")
+
+    units = [{"name": "asrd", "active": "active", "exec": "--port 6006"},
+             {"name": "ttsd", "active": "active", "exec": ""},
+             {"name": "voiced", "active": "failed",
+              "exec": "--device plughw:5,0 --kws-phrases \"астра,астры\""}]
+    steps = panel.pipeline(units, {"hits": 3})
+    eq(len(steps), 7, "схема состоит из семи ступеней")
+    eq(steps[0]["detail"], "plughw:5,0", "устройство захвата взято из юнита")
+    true("астра" in steps[1]["detail"], "формы имени видны в схеме")
+    eq(steps[0]["state"], "bad", "упавшая служба красит ступень схемы")
+
+
 def main() -> int:
     for fn in (test_time, test_numbers_units, test_temperature_percent, test_latin,
                test_real_world, test_check_text, test_ssml,
@@ -809,7 +866,8 @@ def main() -> int:
                test_accusative_detection, test_resolve_threads,
                test_worker_protocol, test_worker_framing,
                test_assistant_reply, test_mono_from_bytes,
-               test_kws_grammar, test_kws_spotter, test_command_recorder):
+               test_kws_grammar, test_kws_spotter, test_command_recorder,
+               test_panel_parse):
         fn()
 
     print(f"пройдено проверок: {PASSED}")
