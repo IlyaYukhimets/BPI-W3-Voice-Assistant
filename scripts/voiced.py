@@ -225,6 +225,10 @@ def main() -> int:
                     help="куда складывать записанные команды (для segment-report)")
     ap.add_argument("--keep", type=int, default=20,
                     help="сколько сегментов хранить в spool")
+    ap.add_argument("--beep-attempts", type=int, default=1,
+                    help="сколько раз пытаться проиграть сигнал (по умолчанию "
+                         "один: отложенный сигнал ложится внутрь команды и "
+                         "портит распознавание)")
     ap.add_argument("--no-wake-beep", action="store_true",
                     help="не играть сигнал после имени")
     ap.add_argument("--beep-tail-frames", type=int, default=6,
@@ -361,7 +365,8 @@ def main() -> int:
                     # 1.5 — терялось «Включи»).
                     drain()
                     if not args.no_wake_beep:
-                        rc = assistant.beep()
+                        rc = assistant.beep(
+                            attempts=args.beep_attempts)
                         if rc != 0:
                             print(f"[kws] сигнал не проигрался (aplay rc={rc})",
                                   flush=True)
