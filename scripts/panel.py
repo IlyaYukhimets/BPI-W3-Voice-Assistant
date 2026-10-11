@@ -300,6 +300,15 @@ def host_info() -> dict:
     return info
 
 
+# Имена действий, которые понимает сервер. Кнопки страницы могут называть их
+# своими словами (tone_close — «послушать закрывающий сигнал»), но КАЖДОЕ имя из
+# разметки обязано быть в этом списке: иначе пользователь видит «неизвестное
+# действие» — так уже было дважды (say_name и tone_close), каждый раз потому, что
+# кнопка звала сервер именем, которого он не знал. Тест test_panel_actions сверяет
+# список с кнопками на странице.
+ACTIONS = ("restart", "say", "say_name", "asr",
+           "tone", "tone_close", "set_tone", "set_close")
+
 VOICED_UNIT = os.path.expanduser("~/.config/systemd/user/voiced.service")
 CUE_OFF = "-"                # значение закрывающего сигнала: молчать
 
@@ -444,6 +453,8 @@ def name_from_unit() -> str:
 def do_action(payload: dict, token: str) -> dict:
     """Выполнить действие из панели. Возвращает {ok, message}."""
     action = payload.get("action")
+    if action not in ACTIONS:
+        return {"ok": False, "message": f"неизвестное действие: {action}"}
     if action == "restart":
         unit = payload.get("unit", "")
         if unit not in UNITS + ("panel",):
@@ -457,7 +468,7 @@ def do_action(payload: dict, token: str) -> dict:
         return set_cue_option("--wake-cue-close",
                               str(payload.get("kind") or CUE_OFF))
 
-    if action == "tone":
+    if action in ("tone", "tone_close"):
         kind = str(payload.get("kind") or assistant.DEFAULT_WAKE_TONE)
         if not assistant.cue_ok(kind):
             return {"ok": False, "message": f"нет такого сигнала: {kind}"}

@@ -738,6 +738,37 @@ def test_cue_file_seconds():
                 sys.modules["soundfile"] = real
 
 
+def test_panel_actions():
+    """Каждая кнопка страницы должна быть понятна серверу — и наоборот.
+
+    Так ловится ошибка, которая повторялась дважды: кнопка зовёт сервер именем,
+    которого он не знает, и пользователь видит «неизвестное действие: …»
+    (сначала say_name, потом tone_close).
+    """
+    import panel
+
+    used = set(re.findall(r'data-act="([^"]+)"', panel.PAGE))
+    true(len(used) >= 6, f"на странице есть кнопки действий ({len(used)})")
+    eq(sorted(used - set(panel.ACTIONS)), [],
+       "у каждой кнопки есть серверное действие")
+    eq(sorted(set(panel.ACTIONS) - used), [],
+       "у каждого серверного действия есть кнопка (иначе это мёртвый код)")
+
+    # И само поведение: прослушивание закрывающего сигнала — не «неизвестное».
+    played = []
+    real = panel.assistant.beep
+    panel.assistant.beep = lambda **kw: (played.append(kw), 0)[1]
+    try:
+        # Встроенный сигнал: файла в песочнице нет, а проверка «это звук» не
+        # пропускает выдуманные имена — так и должно быть.
+        got = panel.do_action({"action": "tone_close", "kind": "bell",
+                               "seconds": 0.7}, token="")
+    finally:
+        panel.assistant.beep = real
+    true("неизвестное действие" not in got["message"], "tone_close больше не ошибка")
+    eq(len(played), 1, "закрывающий сигнал проигрывается по кнопке")
+
+
 def test_voiced_constants():
     """Имена, к которым обращается цикл, должны существовать у своих модулей.
 
@@ -1155,7 +1186,7 @@ def main() -> int:
                test_voiced_constants, test_wake_tones, test_beep_plays_once,
                test_kws_grammar, test_kws_spotter,
                test_command_recorder,
-               test_panel_parse):
+               test_panel_actions, test_panel_parse):
         fn()
 
     print(f"пройдено проверок: {PASSED}")
