@@ -769,6 +769,65 @@ def test_panel_actions():
     eq(len(played), 1, "закрывающий сигнал проигрывается по кнопке")
 
 
+def test_panel_set_cue():
+    """«Сделать рабочим» правит юнит: и когда меняет, и когда менять нечего.
+
+    Вторая ветка — та, где «сделать рабочим» падало с «name 'kind' is not
+    defined»: обработчик ловит исключение и показывает его текстом, из-за чего
+    ошибка выглядела как ответ сервера. Поэтому проверяем обе ветки, и на
+    временном файле с подставным запускателем — настоящий юнит тесты не трогают.
+    """
+    import tempfile
+    import panel
+
+    called = []
+    unit = ("[Service]\n"
+            "ExecStart=%h/python %h/voiced.py \\\n"
+            "  --wake-tone bell \\\n"
+            "  --wake-cue-close - \\\n"
+            "  --device plughw:5,0\n")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "voiced.service")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(unit)
+
+        got = panel.set_cue_option("--wake-tone", "doorbell", unit=path,
+                                   runner=called.append)
+        true(got["ok"], f"сигнал прописан: {got['message']}")
+        eq(panel.exec_option(open(path, encoding="utf-8").read(), "--wake-tone"),
+           "doorbell", "в юните новое значение")
+        true(os.path.exists(path + ".bak"), "бэкап юнита сделан")
+        eq([cmd[2] for cmd in called], ["daemon-reload", "restart"],
+           "после правки цикл перезапускается, а systemd перечитывает юниты")
+
+        called.clear()
+        same = panel.set_cue_option("--wake-tone", "doorbell", unit=path,
+                                    runner=called.append)
+        true(same["ok"], "повторная установка того же сигнала — не ошибка")
+        true("уже так" in same["message"],
+             f"и отвечает по-человечески: {same['message']}")
+        eq(called, [], "лишний раз цикл не перезапускается")
+
+        # «-» — выключенный закрывающий сигнал, а не имя файла.
+        off = panel.set_cue_option("--wake-cue-close", "-", unit=path,
+                                   runner=called.append)
+        true(off["ok"], "закрывающий сигнал можно выключить значением «-»")
+
+    # Кнопки правят именно свои ключи.
+    seen = []
+    real = panel.set_cue_option
+    panel.set_cue_option = lambda option, value: (
+        seen.append((option, value)), {"ok": True, "message": "ок"})[1]
+    try:
+        panel.do_action({"action": "set_tone", "kind": "bell"}, token="")
+        panel.do_action({"action": "set_close", "kind": "-"}, token="")
+    finally:
+        panel.set_cue_option = real
+    eq(seen, [("--wake-tone", "bell"), ("--wake-cue-close", "-")],
+       "кнопки «сделать рабочим» пишут каждая свой ключ")
+
+
 def test_voiced_constants():
     """Имена, к которым обращается цикл, должны существовать у своих модулей.
 
@@ -1186,7 +1245,7 @@ def main() -> int:
                test_voiced_constants, test_wake_tones, test_beep_plays_once,
                test_kws_grammar, test_kws_spotter,
                test_command_recorder,
-               test_panel_actions, test_panel_parse):
+               test_panel_actions, test_panel_set_cue, test_panel_parse):
         fn()
 
     print(f"пройдено проверок: {PASSED}")

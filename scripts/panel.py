@@ -330,7 +330,8 @@ def set_option_in_text(text: str, name: str, value: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def set_cue_option(option: str, value: str) -> dict:
+def set_cue_option(option: str, value: str, unit: str = VOICED_UNIT,
+                   runner=run) -> dict:
     """Прописать сигнал в юните (с бэкапом) и перезапустить цикл.
 
     Панель по умолчанию ничего не меняет, поэтому и это действие — за ключом.
@@ -341,20 +342,23 @@ def set_cue_option(option: str, value: str) -> dict:
     if value != "-" and not assistant.cue_ok(value):
         return {"ok": False, "message": f"нет такого сигнала: {value}"}
     try:
-        with open(VOICED_UNIT, encoding="utf-8") as handle:
+        with open(unit, encoding="utf-8") as handle:
             before = handle.read()
         after = set_option_in_text(before, option, value)
         if after == before:
-            return {"ok": True, "message": f"сигнал уже {kind}"}
-        shutil.copy2(VOICED_UNIT, VOICED_UNIT + ".bak")
-        with open(VOICED_UNIT, "w", encoding="utf-8") as handle:
+            # Значение уже такое: править нечего. Здесь была опечатка в имени
+            # переменной (осталась от прежней сигнатуры) — и «сделать рабочим» на
+            # уже выбранном сигнале падало вместо ответа «уже так».
+            return {"ok": True, "message": f"уже так: {value}"}
+        shutil.copy2(unit, unit + ".bak")
+        with open(unit, "w", encoding="utf-8") as handle:
             handle.write(after)
     except OSError as exc:
         return {"ok": False, "message": f"юнит не правится: {exc}"}
-    run(["systemctl", "--user", "daemon-reload"])
-    run(["systemctl", "--user", "restart", "voiced"])
+    runner(["systemctl", "--user", "daemon-reload"])
+    runner(["systemctl", "--user", "restart", "voiced"])
     print(f"[panel] {option} = {value} "
-          f"(бэкап {os.path.basename(VOICED_UNIT)}.bak)", flush=True)
+          f"(бэкап {os.path.basename(unit)}.bak)", flush=True)
     return {"ok": True,
             "message": f"{option} = {value} — прописано в юните, цикл перезапущен"}
 
