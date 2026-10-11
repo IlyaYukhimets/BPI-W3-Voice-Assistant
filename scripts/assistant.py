@@ -35,49 +35,27 @@ def wake_tone(sample_rate: int = 16000, freq: float = 880.0,
     return (np.sin(2 * np.pi * freq * t) * env * amp).astype(np.float32)
 
 
-def beep(device: str | None = None, attempts: int = 1, pause: float = 0.15,
-         play=None) -> int:
+def beep(device: str | None = None) -> int:
     """Короткий сигнал пробуждения — ТОН, а не слово.
 
     Говорить «слушаю» нельзя: пока ассистент говорит, микрофон заглушён, и
     начало команды потерялось бы. 0.12 с тона в запись команды не попадают
     (детектор стартует по трём кадрам), поэтому мьют для сигнала не нужен.
 
-    ПОПЫТКА ОДНА — и это осознанно. Повторы тут вредят: провальный aplay звука
-    не даёт, но занимает время, и отложенный сигнал приходит ровно тогда, когда
-    колонка уже играет — тон ложится ВНУТРЬ команды и распознавание портится
-    (проверено: после сигнала с ожиданием фраза с колонки читалась хуже).
-    Устройство при этом бывает занято только в одном сценарии — когда фразу
-    проигрывает сама колонка; для проверки имени у панели есть отдельная кнопка.
-    Если сигнал всё же не прозвучал, вызывающий пишет код ошибки в журнал.
-    Параметры оставлены, чтобы можно было включить повторы не правя код.
+    Попытка ровно одна, повторов нет. Провальный aplay звука не даёт, зато
+    занимает время, и отложенный сигнал приходит ровно тогда, когда колонка уже
+    играет, — тон ложится ВНУТРЬ команды и распознавание портится (проверено на
+    живой системе: с ожиданием фраза с колонки читалась хуже). Бывает это только
+    в одном сценарии — когда фразу проигрывает сама колонка, а для проверки
+    имени у панели есть отдельная кнопка. Если сигнал не прозвучал, код ошибки
+    уходит в журнал.
     """
-    import time
+    import tts_core as core
 
     path = os.path.join(os.path.expanduser("~/.assistant"), "wake.wav")
-    if play is None:
-        import tts_core as core
-
-        def play(path, device=None):
-            return core.play(path, device=device or core.DEFAULT_DEVICE, timeout=10)
-
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        core.write_audio(wake_tone(), path, ogg=False)
-
-    rc = 1
-    for attempt in range(max(1, attempts)):   # attempts > 1 — только по флагу
-        rc = play(path, device=device)
-        if rc == 0:
-            if attempt:
-                # Видно, что колонка была занята: полезно при разборе журнала.
-                print(f"[beep] сигнал со {attempt + 1}-й попытки "
-                      f"(колонка была занята)", flush=True)
-            return 0
-        if attempt + 1 < attempts:
-            time.sleep(pause)
-    return rc
-
-
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    core.write_audio(wake_tone(), path, ogg=False)
+    return core.play(path, device=device or core.DEFAULT_DEVICE, timeout=10)
 def make_reply(text: str, template: str = DEFAULT_TEMPLATE) -> str:
     """Реплика ассистента на распознанный текст.
 

@@ -635,33 +635,30 @@ def test_assistant_reply():
     eq(req["json"]["text"], "включить свет", "текст кладётся в тело запроса")
 
 
-def test_beep_retry():
-    """Сигнал повторяется, если колонка занята нашей же озвучкой ответа."""
+def test_beep_plays_once():
+    """Сигнал — это «написать тон и проиграть один раз»: ни повторов, ни цикла."""
     import assistant
+    import tts_core
 
-    calls = []
+    written, played = [], []
+    real_write, real_play = tts_core.write_audio, tts_core.play
+    # Подменяем и запись, и проигрыш: звуковая библиотека в тестовой среде не
+    # нужна (в CI её не ставим), а обвязку сигнала проверить надо.
+    tts_core.write_audio = lambda samples, path, **kw: written.append((samples, path))
+    tts_core.play = lambda path, **kw: (played.append((path, kw)), 0)[1]
+    try:
+        eq(assistant.beep(device="plughw:7,0"), 0, "код проигрывателя отдаётся дальше")
+    finally:
+        tts_core.write_audio, tts_core.play = real_write, real_play
 
-    def flaky(path, device=None):
-        calls.append(device)
-        return 0 if len(calls) >= 3 else 3        # 3 = «Device or resource busy»
-
-    eq(assistant.beep(attempts=3, pause=0.0, play=flaky), 0,
-       "сигнал доигрывается с третьей попытки")
-    eq(len(calls), 3, "две неудачные попытки и одна успешная")
-
-    calls.clear()
-
-    def dead(path, device=None):
-        calls.append(device)
-        return 3
-
-    eq(assistant.beep(attempts=2, pause=0.0, play=dead), 3,
-       "если колонка так и занята — код ошибки уходит вызывающему")
-    eq(len(calls), 2, "попыток ровно столько, сколько задано")
-
-    calls.clear()
-    eq(assistant.beep(pause=0.0, play=dead), 3, "по умолчанию сигнал не повторяется")
-    eq(len(calls), 1, "одна попытка: отложенный сигнал ложится внутрь команды")
+    eq(len(written), 1, "тон записывается один раз")
+    samples, path = written[0]
+    true(path.endswith("wake.wav"), "сигнал пишется в свой файл")
+    true(len(samples) > 0 and max(abs(x) for x in samples) > 0,
+         "тон не пустой — иначе сигнала не слышно")
+    eq(len(played), 1, "ровно одно обращение к проигрывателю, без повторов")
+    eq(played[0][0], path, "играется именно записанный тон")
+    eq(played[0][1].get("device"), "plughw:7,0", "устройство берётся из аргумента")
 
 
 def test_kws_grammar():
@@ -944,7 +941,7 @@ def main() -> int:
                test_accusative_detection, test_resolve_threads,
                test_worker_protocol, test_worker_framing,
                test_assistant_reply, test_mono_from_bytes,
-               test_beep_retry, test_kws_grammar, test_kws_spotter,
+               test_beep_plays_once, test_kws_grammar, test_kws_spotter,
                test_command_recorder,
                test_panel_parse):
         fn()
