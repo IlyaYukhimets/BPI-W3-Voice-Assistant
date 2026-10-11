@@ -857,6 +857,35 @@ def test_panel_parse():
     true("астра" in steps[1]["detail"], "формы имени видны в схеме")
     eq(steps[0]["state"], "bad", "упавшая служба красит ступень схемы")
 
+    # Документы: имя проверяется, иначе панель отдавала бы что угодно с диска.
+    true(panel.doc_path("13-kws.md") is not None, "документ по имени находится")
+    eq(panel.doc_path("../etc/passwd"), None, "выход из каталога отсекается")
+    eq(panel.doc_path("/etc/passwd.md"), None, "абсолютный путь отсекается")
+    eq(panel.doc_path("panel.py"), None, "чужое расширение отсекается")
+    eq(panel.doc_path(""), None, "пустое имя отсекается")
+
+    # Действия: без файла с ключом их нет вообще.
+    eq(panel.check_token("любой", ""), "disabled", "без ключа на плате — выключено")
+    eq(panel.check_token("неверный", "секрет"), "denied", "чужой ключ отвергается")
+    eq(panel.check_token("секрет", "секрет"), "ok", "свой ключ принимается")
+    eq(panel.check_token(None, "секрет"), "denied", "без заголовка — отказ")
+
+    # Неизвестное действие и чужая служба не выполняются.
+    true(not panel.do_action({"action": "rm-rf"}, "x")["ok"],
+         "неизвестное действие отвергается")
+    true(not panel.do_action({"action": "restart", "unit": "ssh"}, "x")["ok"],
+         "перезапуск чужой службы отвергается")
+
+    # История уровней: для графика, без повторов при каждом обновлении.
+    panel.HISTORY.clear()
+    panel.add_history([{"index": 1, "levels": {"peak": -20, "speech": 0.4},
+                        "text": "ок"},
+                       {"index": 2, "levels": {"peak": -40, "speech": 0.0}}])
+    panel.add_history([{"index": 2, "levels": {"peak": -40, "speech": 0.0}}])
+    eq(len(panel.HISTORY), 2, "повторное обновление не дублирует точки графика")
+    eq(panel.HISTORY[0]["peak"], -20, "уровень попал в историю")
+    panel.HISTORY.clear()
+
 
 def main() -> int:
     for fn in (test_time, test_numbers_units, test_temperature_percent, test_latin,

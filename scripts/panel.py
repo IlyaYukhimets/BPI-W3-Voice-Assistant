@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
-"""panel.py — лёгкая веб-панель ассистента: схема, службы, журнал, фразы.
+"""panel.py — веб-панель ассистента: схема, службы, фразы, журналы, доки.
 
-ЗАЧЕМ. Проект вырос: три резидентные службы, KWS, модель ASR, папка сегментов,
-журналы. Чтобы не ходить в ssh за каждой мелочью, панель показывает текущее
-состояние в одном месте: схему тракта (кто с кем связан), состояние служб,
-последние фразы с уровнями и распознанным текстом, хвосты журнала, модели и
-настройки запуска.
+ЗАЧЕМ. Проект вырос: три резидентные службы, слой KWS, модель ASR, папка
+сегментов, журналы. Панель показывает состояние в одном месте: схему тракта
+(кто с кем связан), службы с памятью, последние фразы с уровнями и текстом,
+историю уровней, журналы в три столбца и документацию во всплывающем окне.
 
 ПОЧЕМУ БЕЗ ЗАВИСИМОСТЕЙ. Только стандартная библиотека (http.server) и
-системные команды, которые на плате уже есть (systemctl/journalctl/arecord).
-Ни БД, ни авторизации, ни сборки: панель НИЧЕГО не меняет, поэтому и защищать
-нечего — она читает журнал пользователя и листинг своего же spool.
+системные команды, которые на плате уже есть (systemctl/journalctl). Ни БД, ни
+шаблонизатора, ни сборки.
 
-Запуск (user-юнит assistant-panel.service):
+ЧТО МОЖЕТ МЕНЯТЬ. По умолчанию — НИЧЕГО (только чтение). Действия (перезапуск
+службы, тестовая озвучка, прогон ASR по последнему сегменту) включаются файлом
+с ключом:
+
+    head -c 24 /dev/urandom | base64 > ~/.assistant/panel.token
+
+и вводятся в панели в поле «ключ». Без файла ручки отвечают 403 и в интерфейсе
+неактивны.
+
+Запуск (user-юнит panel.service):
     ~/models/tts-venv/bin/python scripts/panel.py --port 8080
 Открывается: http://<ip платы>:8080
 """
@@ -22,14 +29,23 @@ import argparse
 import json
 import os
 import re
+import secrets
 import subprocess
+import sys
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UNITS = ("ttsd", "asrd", "voiced")
 SPOOL = os.path.expanduser("~/.assistant/segments")
+TOKEN_FILE = os.path.expanduser("~/.assistant/panel.token")
+PYTHON = os.path.expanduser("~/models/tts-venv/bin/python")
+ASR_PORT, TTS_PORT = 6006, 6007
+HISTORY = deque(maxlen=400)      # уровни фраз: для графика по времени
 
 
 def run(cmd: list[str], timeout: float = 5.0) -> str:
@@ -42,7 +58,7 @@ def run(cmd: list[str], timeout: float = 5.0) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Сбор данных (всё — чистые функции: их и проверяют тесты)
+# Сбор данных: чистые функции, их и проверяют тесты.
 # ---------------------------------------------------------------------------
 def parse_show(text: str) -> dict:
     """Вывод `systemctl show -p K=V` -> словарь."""
@@ -101,9 +117,8 @@ def clean_lines(text: str) -> list[str]:
         line = line.rstrip()
         if not line or NOISE.search(line):
             continue
-        # «ubuntu python[123]: текст» -> «текст»
         if "]: " in line:
-            line = line.split("]: ", 1)[1]
+            line = line.split("]: ", 1)[1]     # «ubuntu python[1]: текст» -> текст
         out.append(line)
     return out
 
@@ -124,11 +139,11 @@ SILENT_RE = re.compile(r"^\[kws\] команды не последовало з�
 
 
 def parse_events(lines: list[str]) -> dict:
-    """Разобрать журнал voiced в события: фразы, срабатывания, отказы.
+    """Разобрать журнал voiced: фразы, срабатывания KWS, отказы.
 
-    Фразы собираются по НОМЕРУ сегмента: строка [seg] даёт уровни, строка
-    «N: текст» — распознанное, «[asr] N: не расслышал» — неудачу. Так панель
-    показывает то же, что видно в журнале, без повторного распознавания.
+    Фразы собираются по НОМЕРУ сегмента: [seg] даёт уровни, «N: текст» —
+    распознанное, «[asr] N: не расслышал» — неудачу. Так панель показывает то же,
+    что в журнале, не гоняя распознавание заново.
     """
     segs: dict[int, dict] = {}
     order: list[int] = []
@@ -160,15 +175,15 @@ def parse_events(lines: list[str]) -> dict:
             index = int(m.group(1))
             if index not in segs:
                 order.append(index)
-            segs.setdefault(index, {}).update(
-                {"text": m.group(2), "asr_s": float(m.group(3))})
+            segs.setdefault(index, {}).update({"text": m.group(2),
+                                               "asr_s": float(m.group(3))})
             continue
         if (m := FAIL_RE.match(line)):
             index = int(m.group(1))
             if index not in segs:
                 order.append(index)
-            segs.setdefault(index, {}).update(
-                {"text": "", "asr_s": float(m.group(2)), "failed": True})
+            segs.setdefault(index, {}).update({"text": "", "asr_s": float(m.group(2)),
+                                               "failed": True})
             continue
         if line.startswith("[reply]"):
             replies.append(line[len("[reply] "):])
@@ -177,7 +192,21 @@ def parse_events(lines: list[str]) -> dict:
     return {"segments": segments[-12:], "kws": kws, "replies": replies[-3:]}
 
 
-def spool_files() -> list[dict]:
+def add_history(segments: list[dict]) -> None:
+    """Дописать уровни новых фраз в историю (для графика по времени)."""
+    known = {h["index"] for h in HISTORY}
+    for seg in segments:
+        levels = seg.get("levels") or {}
+        if seg["index"] in known or "peak" not in levels:
+            continue
+        HISTORY.append({"index": seg["index"], "peak": levels["peak"],
+                        "speech": levels.get("speech", 0.0),
+                        "text": seg.get("text", ""),
+                        "time": time.strftime("%H:%M")})
+        known.add(seg["index"])
+
+
+def spool_files(limit: int = 8) -> list[dict]:
     """Что лежит на диске: имена с временем, размер, время изменения."""
     try:
         names = sorted(os.listdir(SPOOL),
@@ -185,7 +214,7 @@ def spool_files() -> list[dict]:
     except OSError:
         return []
     out = []
-    for name in names[-8:]:
+    for name in names[-limit:]:
         path = os.path.join(SPOOL, name)
         try:
             st = os.stat(path)
@@ -194,6 +223,12 @@ def spool_files() -> list[dict]:
         out.append({"name": name, "kb": round(st.st_size / 1024.0, 1),
                     "time": time.strftime("%H:%M:%S", time.localtime(st.st_mtime))})
     return out
+
+
+def last_segment() -> str | None:
+    """Самый свежий сегмент в spool — по нему прогоняем ASR из панели."""
+    files = spool_files(limit=1)
+    return os.path.join(SPOOL, files[-1]["name"]) if files else None
 
 
 def models() -> list[dict]:
@@ -241,14 +276,11 @@ def host_info() -> dict:
             info["temp_c"] = round(int(fh.read().strip()) / 1000.0, 1)
     except (OSError, ValueError):
         pass
-    info["capture"] = " | ".join(
-        l.split("[", 1)[1].rstrip("]") if "[" in l else l
-        for l in run(["arecord", "-l"]).splitlines() if l.startswith("card"))
     return info
 
 
 def pipeline(units: list[dict], kws_stats: dict) -> list[dict]:
-    """Схема тракта со живым состоянием на каждой ступени."""
+    """Схема тракта с живым состоянием на каждой ступени."""
     by_name = {u["name"]: u for u in units}
     voiced = by_name.get("voiced", {})
     options = voiced.get("exec", "")
@@ -258,7 +290,7 @@ def pipeline(units: list[dict], kws_stats: dict) -> list[dict]:
         {"stage": "Микрофон", "detail": mic.group(1) if mic else "plughw:5,0",
          "state": "ok" if voiced.get("active") == "active" else "bad"},
         {"stage": "Vosk-KWS (имя)",
-         "detail": (phrases.group(1) if phrases else "астра") +
+         "detail": (phrases.group(1) if phrases else "астра").strip() +
                    f"; срабатываний {kws_stats.get('hits', 0)}",
          "state": "ok" if kws_stats.get("hits") else "wait"},
         {"stage": "Сигнал", "detail": "тон 880 Гц, 0.12 с", "state": "ok"},
@@ -274,13 +306,83 @@ def pipeline(units: list[dict], kws_stats: dict) -> list[dict]:
     ]
 
 
-ASR_PORT = 6006
-TTS_PORT = 6007
+# ---------------------------------------------------------------------------
+# Действия (только при наличии ключа) и документы
+# ---------------------------------------------------------------------------
+DOC_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*\.md$")
 
 
-def state() -> dict:
+def doc_path(name: str) -> str | None:
+    """Путь к документу по имени или None. Имя проверяется: выход из каталога
+    (../, абсолютные пути, чужие расширения) отсекается по шаблону."""
+    if not name or not DOC_RE.match(name):
+        return None
+    path = os.path.join(REPO, "docs", name)
+    return path if os.path.isfile(path) else None
+
+
+def load_token(path: str = TOKEN_FILE) -> str:
+    """Ключ доступа из файла; нет файла — действия выключены."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def check_token(given: str | None, expected: str) -> str:
+    """ok — можно выполнять, disabled — ключа нет на плате, denied — не тот.
+
+    Сравниваем БАЙТЫ: secrets.compare_digest не принимает строки с не-ASCII
+    символами (падает с TypeError), а ключ в файле может быть любым.
+    """
+    if not expected:
+        return "disabled"
+    if given and secrets.compare_digest(given.strip().encode("utf-8"),
+                                        expected.encode("utf-8")):
+        return "ok"
+    return "denied"
+
+
+def do_action(payload: dict, token: str) -> dict:
+    """Выполнить действие из панели. Возвращает {ok, message}."""
+    action = payload.get("action")
+    if action == "restart":
+        unit = payload.get("unit", "")
+        if unit not in UNITS + ("panel",):
+            return {"ok": False, "message": f"неизвестная служба: {unit}"}
+        out = run(["systemctl", "--user", "restart", unit], timeout=20)
+        return {"ok": True, "message": f"{unit}: перезапуск отправлен"}
+    if action == "say":
+        text = str(payload.get("text", ""))[:200].strip()
+        if not text:
+            return {"ok": False, "message": "пустой текст"}
+        # Список аргументов, без shell: текст не может стать командой.
+        proc = subprocess.run([PYTHON, os.path.join(REPO, "scripts", "tts_say.py"),
+                               text], capture_output=True, timeout=60)
+        ok = proc.returncode == 0
+        return {"ok": ok, "message": (f"сказано: «{text}»" if ok else
+                                      f"озвучка вернула код {proc.returncode}")}
+    if action == "asr":
+        path = last_segment()
+        if not path:
+            return {"ok": False, "message": "в spool нет сегментов"}
+        import voiced                       # тот же путь, что в рабочем цикле
+        with open(path, "rb") as fh:
+            import wave
+            with wave.open(path, "rb") as w:
+                pcm = w.readframes(w.getnframes())
+        text, took = voiced.recognize_segment(path, pcm, "127.0.0.1", ASR_PORT)
+        return {"ok": bool(text.strip()),
+                "message": (f"«{text}» за {took:.2f} с" if text.strip()
+                            else f"не расслышал ({took:.2f} с)")}
+    return {"ok": False, "message": f"неизвестное действие: {action}"}
+
+
+def state(token: str) -> dict:
     units = units_state()
     events = parse_events(journal("voiced", 120))
+    add_history(events["segments"])
     return {
         "host": host_info(),
         "units": units,
@@ -288,37 +390,40 @@ def state() -> dict:
         "segments": events["segments"],
         "kws": events["kws"],
         "replies": events["replies"],
+        "history": list(HISTORY)[-80:],
         "spool": spool_files(),
         "models": models(),
-        "logs": {u: journal(u, 25) for u in UNITS},
+        "logs": {u: journal(u, 40) for u in UNITS},
         "docs": sorted(f for f in os.listdir(os.path.join(REPO, "docs"))
                        if f.endswith(".md")),
+        "actions": bool(token),
         "ts": time.strftime("%H:%M:%S"),
     }
 
 
 # ---------------------------------------------------------------------------
-PAGE = """<!DOCTYPE html>
+PAGE = r"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <title>Голосовой ассистент — панель</title>
 <style>
 :root{--bg:#12151a;--card:#1b2027;--fg:#e6e9ee;--dim:#8b95a5;--ok:#3ecf8e;
---bad:#ef5f5f;--wait:#e0a94a;--line:#2a313b}
+--bad:#ef5f5f;--wait:#e0a94a;--line:#2a313b;--code:#161a20}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,
-sans-serif}
-header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;
-gap:18px;align-items:baseline;flex-wrap:wrap}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,sans-serif}
+header{padding:12px 20px;border-bottom:1px solid var(--line);display:flex;gap:16px;
+align-items:center;flex-wrap:wrap;position:sticky;top:0;background:var(--bg);z-index:5}
 h1{font-size:16px;margin:0;font-weight:600}
-h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);
-margin:0 0 10px}
-main{padding:18px 20px;display:grid;gap:18px;grid-template-columns:repeat(auto-fit,
-minmax(340px,1fr))}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);
+margin:0 0 10px;display:flex;gap:8px;align-items:center}
+main{padding:18px 20px;display:grid;gap:16px;
+grid-template-columns:repeat(auto-fit,minmax(330px,1fr));align-items:start}
 section{background:var(--card);border:1px solid var(--line);border-radius:10px;
-padding:14px 16px}
-.card-wide{grid-column:1/-1}
-.pipe{display:flex;flex-wrap:wrap;gap:8px;align-items:stretch}
-.step{flex:1 1 130px;border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+padding:14px 16px;min-width:0}
+.wide{grid-column:1/-1}
+.logs{display:grid;gap:12px;grid-template-columns:repeat(3,minmax(0,1fr))}
+@media(max-width:900px){.logs{grid-template-columns:1fr}}
+.pipe{display:flex;flex-wrap:wrap;gap:6px;align-items:stretch}
+.step{flex:1 1 120px;border:1px solid var(--line);border-radius:8px;padding:7px 9px}
 .step b{display:block;font-size:13px}
 .step span{color:var(--dim);font-size:12px}
 .step.ok{border-left:3px solid var(--ok)}
@@ -326,135 +431,346 @@ padding:14px 16px}
 .step.wait{border-left:3px solid var(--wait)}
 .arrow{align-self:center;color:var(--dim)}
 table{width:100%;border-collapse:collapse;font-size:13px}
-th{text-align:left;color:var(--dim);font-weight:500;padding:4px 6px;
+th{text-align:left;color:var(--dim);font-weight:500;padding:3px 6px;
 border-bottom:1px solid var(--line)}
-td{padding:4px 6px;border-bottom:1px solid #20262e;vertical-align:top}
+td{padding:3px 6px;border-bottom:1px solid #20262e;vertical-align:top}
 .mono{font-family:ui-monospace,monospace}
-.bar{height:8px;border-radius:4px;background:#2a313b;position:relative;
-min-width:60px}
+.bar{height:7px;border-radius:4px;background:#2a313b;position:relative;min-width:50px}
 .bar i{position:absolute;left:0;top:0;bottom:0;border-radius:4px;background:var(--ok)}
-.bad{color:var(--bad)}.dim{color:var(--dim)}
+.dim{color:var(--dim)}.miss{color:var(--wait)}
 .tag{display:inline-block;padding:1px 7px;border-radius:10px;font-size:12px;
 border:1px solid var(--line)}
 .tag.ok{color:var(--ok);border-color:#2b5f45}
 .tag.bad{color:var(--bad);border-color:#5f2b2b}
-pre{margin:0;max-height:260px;overflow:auto;font-size:12px;
-font-family:ui-monospace,monospace;white-space:pre-wrap;word-break:break-word}
-.hit{color:var(--ok)}.miss{color:var(--wait)}
-a{color:#7fb3ff}
+pre{margin:0;padding:8px;background:var(--code);border-radius:6px;max-height:230px;
+overflow:auto;font-size:11.5px;font-family:ui-monospace,monospace;white-space:pre-wrap;
+word-break:break-word}
+pre .t{color:#5c6675}
+.lhit{color:var(--ok)}.lmiss{color:var(--wait)}.lerr{color:var(--bad)}
+button{background:#232a33;color:var(--fg);border:1px solid var(--line);
+border-radius:6px;padding:4px 9px;font-size:12px;cursor:pointer}
+button:hover{border-color:#3d4753}
+button:disabled{opacity:.45;cursor:not-allowed}
+.doclink{cursor:pointer;color:#7fb3ff;font-size:12.5px;display:block;padding:1px 0}
+#modal{position:fixed;inset:0;background:rgba(6,8,11,.72);display:none;
+align-items:center;justify-content:center;padding:24px;z-index:20}
+#modal.on{display:flex}
+#doc{background:var(--card);border:1px solid var(--line);border-radius:12px;
+max-width:900px;width:100%;max-height:84vh;overflow:auto;padding:20px 24px}
+#doc h3{margin:14px 0 6px;font-size:15px}
+#doc h4{margin:12px 0 4px;font-size:14px;color:#cfd6df}
+#doc code{background:var(--code);padding:1px 5px;border-radius:4px;
+font-family:ui-monospace,monospace;font-size:12.5px}
+#doc pre{background:var(--code);padding:10px;overflow:auto;font-size:12px;
+border-radius:6px}
+#doc ul{margin:6px 0;padding-left:20px}
+#doc a{color:#7fb3ff}
+#doc table{margin:8px 0}
+#doc .close{float:right;cursor:pointer;color:var(--dim)}
+#key{width:110px;background:#232a33;border:1px solid var(--line);color:var(--fg);
+border-radius:6px;padding:3px 7px;font-size:12px}
+#note{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);
+background:#232a33;border:1px solid var(--line);border-radius:8px;padding:8px 14px;
+font-size:13px;display:none;z-index:30}
+#note.on{display:block}
 </style></head><body>
-<header><h1>🎙 Голосовой ассистент «Астра»</h1>
-<span id="host" class="dim"></span><span id="ts" class="dim"></span></header>
+<header>
+  <h1>🎙 Голосовой ассистент «Астра»</h1>
+  <span id="host" class="dim"></span><span id="ts" class="dim"></span>
+  <span style="margin-left:auto" class="dim">ключ: <input id="key" type="password"
+  placeholder="для действий"></span>
+</header>
 <main>
-<section class="card-wide"><h2>Схема тракта</h2><div class="pipe" id="pipe"></div></section>
+<section class="wide"><h2>Схема тракта</h2><div class="pipe" id="pipe"></div></section>
 <section><h2>Службы</h2><table id="units"></table></section>
+<section><h2>Уровни фраз</h2><svg id="chart" width="100%" height="120"
+  viewBox="0 0 400 120" preserveAspectRatio="none"></svg>
+  <div class="dim mono" id="chart-note" style="font-size:11.5px"></div></section>
 <section><h2>Последние фразы</h2><table id="segments"></table></section>
+<section><h2>Действия <span id="act-state" class="dim"></span></h2>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <button class="act" data-act="restart" data-unit="voiced">перезапустить voiced</button>
+    <button class="act" data-act="restart" data-unit="asrd">asrd</button>
+    <button class="act" data-act="restart" data-unit="ttsd">ttsd</button>
+  </div>
+  <div style="display:flex;gap:8px;margin-top:8px">
+    <input id="phrase" placeholder="фраза для теста озвучки"
+      style="flex:1;background:#232a33;border:1px solid var(--line);color:var(--fg);
+      border-radius:6px;padding:4px 8px;font-size:12px">
+    <button class="act" data-act="say">сказать</button>
+    <button class="act" data-act="asr">ASR по последнему</button>
+  </div>
+  <div class="dim" style="font-size:11.5px;margin-top:6px">Действия требуют ключа
+  (файл ~/.assistant/panel.token)</div></section>
 <section><h2>Модели</h2><table id="models"></table></section>
 <section><h2>Файлы сегментов</h2><table id="spool"></table></section>
-<section><h2>Журнал: KWS и отказы</h2><pre id="kws"></pre></section>
-<section class="card-wide"><h2>Журнал voiced</h2><pre id="log-voiced"></pre>
-<h2 style="margin-top:12px">Журнал asrd</h2><pre id="log-asrd"></pre>
-<h2 style="margin-top:12px">Журнал ttsd</h2><pre id="log-ttsd"></pre></section>
+<section><h2>KWS и пропуски</h2><pre id="kws"></pre></section>
+<section class="wide"><h2>Журналы</h2>
+  <div class="logs">
+    <div><div class="dim mono" style="font-size:11.5px;margin-bottom:4px">voiced</div>
+      <pre id="log-voiced"></pre></div>
+    <div><div class="dim mono" style="font-size:11.5px;margin-bottom:4px">asrd</div>
+      <pre id="log-asrd"></pre></div>
+    <div><div class="dim mono" style="font-size:11.5px;margin-bottom:4px">ttsd</div>
+      <pre id="log-ttsd"></pre></div>
+  </div></section>
 <section><h2>Документы</h2><div id="docs"></div></section>
 </main>
+<div id="modal"><div id="doc"><span class="close">✕ закрыть</span><div id="doc-body"></div></div></div>
+<div id="note"></div>
 <script>
-const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;',
-'>':'&gt;'}[c]));
+const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const $ = id => document.getElementById(id);
+const keyInput = $('key');
+keyInput.value = localStorage.getItem('panelKey') || '';
+keyInput.addEventListener('input', () => localStorage.setItem('panelKey', keyInput.value));
+
+function note(msg, bad){
+  const el = $('note');
+  el.textContent = msg;
+  el.style.borderColor = bad ? '#5f2b2b' : '#2b5f45';
+  el.classList.add('on');
+  clearTimeout(note.t);
+  note.t = setTimeout(() => el.classList.remove('on'), 6000);
+}
+
+/* Своя мини-разметка: заголовки, списки, код, жирный, ссылки — без библиотек. */
+function md(text){
+  const lines = String(text).split('\n');
+  let html = '', inCode = false, inList = false, inTable = false;
+  const inline = s => esc(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+  const closeList = () => { if (inList) { html += '</ul>'; inList = false; } };
+  const closeTable = () => { if (inTable) { html += '</table>'; inTable = false; } };
+  for (const raw of lines){
+    const line = raw.replace(/\s+$/, '');
+    if (line.startsWith('```')){
+      closeList(); closeTable();
+      html += inCode ? '</pre>' : '<pre>';
+      inCode = !inCode; continue;
+    }
+    if (inCode){ html += esc(raw) + '\n'; continue; }
+    if (/^\s*$/.test(line)){ closeList(); closeTable(); continue; }
+    if (/^\|/.test(line)){
+      closeList();
+      const cells = line.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+      if (!inTable){ inTable = true; html += '<table>'; }
+      if (/^[-: ]+$/.test(cells.join(''))) continue;
+      const tag = html.endsWith('<table>') ? 'th' : 'td';
+      html += '<tr>' + cells.map(c => `<${tag}>${inline(c)}</${tag}>`).join('') + '</tr>';
+      continue;
+    }
+    closeTable();
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    if (h){ closeList(); html += `<h4>${inline(h[2])}</h4>`; continue; }
+    const li = line.match(/^\s*(?:[-*]|\d+\.)\s+(.*)$/);
+    if (li){ if (!inList){ html += '<ul>'; inList = true; } html += `<li>${inline(li[1])}</li>`; continue; }
+    closeList();
+    html += `<p>${inline(line)}</p>`;
+  }
+  if (inCode) html += '</pre>';
+  closeList(); closeTable();
+  return html;
+}
+
+async function openDoc(name){
+  try {
+    const r = await fetch('/api/doc?name=' + encodeURIComponent(name));
+    const d = await r.json();
+    $('doc-body').innerHTML = `<h3>${esc(d.name)}</h3>` + (d.text ? md(d.text) : 'нет файла');
+  } catch(e){ $('doc-body').innerHTML = 'не удалось загрузить документ'; }
+  $('modal').classList.add('on');
+}
+$('modal').addEventListener('click', e => { if (e.target.id === 'modal') $('modal').classList.remove('on'); });
+document.querySelector('#doc .close').addEventListener('click', () => $('modal').classList.remove('on'));
+document.addEventListener('keydown', e => { if (e.key === 'Escape') $('modal').classList.remove('on'); });
+
+async function act(btn){
+  const action = btn.dataset.act;
+  const body = {action};
+  if (action === 'restart') body.unit = btn.dataset.unit;
+  if (action === 'say') body.text = $('phrase').value;
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/action', {method:'POST',
+      headers:{'Content-Type':'application/json','X-Panel-Token':keyInput.value},
+      body: JSON.stringify(body)});
+    const d = await r.json();
+    note(d.message + (d.ok ? '' : ' — ошибка'), !d.ok);
+  } catch(e){ note('панель не ответила', true); }
+  btn.disabled = false;
+  tick();
+}
+document.addEventListener('click', e => { if (e.target.classList.contains('act')) act(e.target); });
+
+function drawChart(hist){
+  const svg = $('chart');
+  const pts = hist || [];
+  if (pts.length < 2){ svg.innerHTML = '<text x="8" y="60" fill="#8b95a5" '
+    + 'font-size="11">мало данных: нужно хотя бы две фразы</text>'; return; }
+  const w = 400, h = 120, pad = 6;
+  const y = db => pad + (1 - Math.max(0, Math.min(1, (db + 60) / 60))) * (h - 2 * pad);
+  const step = (w - 2 * pad) / (pts.length - 1);
+  let line = '', marks = '';
+  pts.forEach((p, i) => { line += `${i ? 'L' : 'M'}${(pad + i * step).toFixed(1)},${y(p.peak).toFixed(1)} `; });
+  pts.forEach((p, i) => {
+    const x = pad + i * step, yy = y(p.peak);
+    marks += `<circle cx="${x.toFixed(1)}" cy="${yy.toFixed(1)}" r="2.2"
+      fill="${p.text ? '#3ecf8e' : '#e0a94a'}"><title>${esc(p.time)} · ${p.peak} дБ ·
+      ${esc(p.text || 'не расслышал')}</title></circle>`;
+  });
+  svg.innerHTML = `<line x1="0" y1="${y(0)}" x2="${w}" y2="${y(0)}" stroke="#2a313b"/>
+    <line x1="0" y1="${y(-60)}" x2="${w}" y2="${y(-60)}" stroke="#2a313b"/>
+    <path d="${line}" fill="none" stroke="#7fb3ff" stroke-width="1.4"/>${marks}`;
+}
+
 async function tick(){
   let d;
   try { d = await (await fetch('/api/state')).json(); }
-  catch(e){ document.getElementById('ts').textContent = 'нет связи с панелью';
-    return; }
+  catch(e){ $('ts').textContent = 'нет связи с панелью'; return; }
   const h = d.host || {};
-  document.getElementById('host').textContent =
-    `${h.host} · ${h.ip} · up ${h.uptime} · RAM ${h.mem_avail_mb}/${h.mem_total_mb} МБ`
-    + (h.temp_c ? ` · ${h.temp_c} °C` : '') + (h.capture ? ` · ${h.capture}` : '');
-  document.getElementById('ts').textContent = 'обновлено ' + d.ts;
-  document.getElementById('pipe').innerHTML = (d.pipeline||[]).map((p,i) =>
-    (i? '<div class="arrow">→</div>':'') +
+  $('host').textContent = `${h.host} · ${h.ip} · up ${h.uptime} · RAM `
+    + `${h.mem_avail_mb}/${h.mem_total_mb} МБ` + (h.temp_c ? ` · ${h.temp_c} °C` : '');
+  $('ts').textContent = 'обновлено ' + d.ts;
+  $('pipe').innerHTML = (d.pipeline||[]).map((p,i) =>
+    (i ? '<div class="arrow">→</div>' : '') +
     `<div class="step ${p.state}"><b>${esc(p.stage)}</b><span>${esc(p.detail)}</span></div>`
   ).join('');
-  document.getElementById('units').innerHTML =
-    '<tr><th>служба</th><th>состояние</th><th>PID</th><th>RSS</th><th>перезапусков</th></tr>' +
-    (d.units||[]).map(u => `<tr><td class="mono">${esc(u.name)}</td>
-    <td><span class="tag ${u.active==='active'?'ok':'bad'}">${esc(u.active)}</span></td>
+  $('units').innerHTML = '<tr><th>служба</th><th>состояние</th><th>PID</th><th>RSS</th>'
+    + '<th>рестартов</th></tr>' + (d.units||[]).map(u =>
+    `<tr><td class="mono">${esc(u.name)}</td><td><span class="tag
+    ${u.active==='active'?'ok':'bad'}">${esc(u.active)}</span></td>
     <td class="mono">${u.pid||'-'}</td><td class="mono">${u.rss_mb?u.rss_mb+' МБ':'-'}</td>
     <td class="mono">${u.restarts}</td></tr>`).join('');
-  document.getElementById('segments').innerHTML =
-    '<tr><th>№</th><th>речь</th><th>пик</th><th>распознано</th></tr>' +
-    (d.segments||[]).slice().reverse().map(s => {
-      const l = s.levels || {};
-      const peak = l.peak ?? -99;
+  drawChart(d.history);
+  $('chart-note').textContent = `точки: ${(d.history||[]).length} · зелёная — фраза
+    распознана, жёлтая — нет · по вертикали пик, дБ (-60…0)`;
+  $('segments').innerHTML = '<tr><th>№</th><th>речь</th><th>пик</th><th>распознано</th></tr>'
+    + (d.segments||[]).slice().reverse().map(s => {
+      const l = s.levels || {}, peak = l.peak ?? -99;
       const w = Math.max(2, Math.min(100, 100 + peak * 3));
-      return `<tr><td class="mono">${s.index}</td>
-      <td class="mono">${l.speech ?? '-'} с</td>
+      return `<tr><td class="mono">${s.index}</td><td class="mono">${l.speech ?? '-'} с</td>
       <td><div class="bar"><i style="width:${w}%"></i></div>
       <span class="dim mono">${peak} дБ</span></td>
       <td>${s.text ? esc(s.text) : '<span class="miss">не расслышал</span>'}</td></tr>`;
     }).join('');
-  document.getElementById('models').innerHTML =
-    '<tr><th>модель</th><th>состояние</th><th>размер</th></tr>' +
-    (d.models||[]).map(m => `<tr><td>${esc(m.label)}<div class="dim mono"
-    style="font-size:11px">${esc(m.path)}</div></td>
-    <td><span class="tag ${m.ok?'ok':'bad'}">${m.ok?'на месте':'нет'}</span></td>
+  $('models').innerHTML = '<tr><th>модель</th><th>состояние</th><th>размер</th></tr>'
+    + (d.models||[]).map(m => `<tr><td>${esc(m.label)}<div class="dim mono"
+    style="font-size:11px">${esc(m.path)}</div></td><td><span class="tag
+    ${m.ok?'ok':'bad'}">${m.ok?'на месте':'нет'}</span></td>
     <td class="mono">${m.mb} МБ</td></tr>`).join('');
-  document.getElementById('spool').innerHTML =
-    '<tr><th>файл</th><th>время</th><th>размер</th></tr>' +
-    (d.spool||[]).map(f => `<tr><td class="mono">${esc(f.name)}</td>
+  $('spool').innerHTML = '<tr><th>файл</th><th>время</th><th>размер</th></tr>'
+    + (d.spool||[]).map(f => `<tr><td class="mono">${esc(f.name)}</td>
     <td class="mono">${esc(f.time)}</td><td class="mono">${f.kb} КБ</td></tr>`).join('');
   const k = d.kws || {};
   let kw = `срабатываний имени: ${k.hits||0} (кадров прослушано ${k.frames||0})`;
   if (k.name_db !== null && k.name_db !== undefined) kw += `, громкость имени ${k.name_db} дБ`;
-  if (k.last_margin) kw += `\\nпоследний пропуск команды: шум ${k.last_margin.noise}, `
+  if (k.last_margin) kw += `\nпоследний пропуск команды: шум ${k.last_margin.noise}, `
     + `громче всего ${k.last_margin.loudest} против порога ${k.last_margin.threshold}`;
-  if ((d.replies||[]).length) kw += `\\nпоследний ответ: ${d.replies.slice(-1)[0]}`;
-  document.getElementById('kws').textContent = kw;
-  for (const u of ['voiced','asrd','ttsd']) {
-    const el = document.getElementById('log-'+u);
-    el.innerHTML = ((d.logs||{})[u]||[]).map(line => {
+  if ((d.replies||[]).length) kw += `\nпоследний ответ: ${d.replies.slice(-1)[0]}`;
+  $('kws').textContent = kw;
+  for (const u of ['voiced','asrd','ttsd']){
+    $('log-'+u).innerHTML = ((d.logs||{})[u]||[]).map(line => {
       let cls = '';
-      if (line.startsWith('[kws]')) cls = 'hit';
-      else if (line.startsWith('[asr]')) cls = 'miss';
-      return `<div class="${cls}">${esc(line)}</div>`;
+      if (line.startsWith('[kws]')) cls = 'lhit';
+      else if (line.startsWith('[asr]')) cls = 'lmiss';
+      else if (line.startsWith('[reply]')) cls = 'lhit';
+      else if (/Traceback|Error|error/.test(line)) cls = 'lerr';
+      const m = line.match(/^\[([a-z]+)\]|^(\d+):/);
+      const head = m ? `<span class="t">${esc(m[0])}</span>` : '';
+      const body = m ? line.slice(m[0].length) : line;
+      return `<div class="${cls}">${head}${esc(body)}</div>`;
     }).join('');
   }
-  document.getElementById('docs').innerHTML = (d.docs||[]).map(f =>
-    `<div><a href="https://github.com/IlyaYukhimets/BPI-W3-Voice-Assistant/blob/main/docs/${f}"
-    target="_blank">${esc(f)}</a></div>`).join('');
+  $('docs').innerHTML = (d.docs||[]).map(f =>
+    `<span class="doclink" data-doc="${esc(f)}">📄 ${esc(f)}</span>`).join('');
+  const enabled = !!d.actions;
+  $('act-state').textContent = enabled ? '(ключ есть)' : '(только чтение)';
+  document.querySelectorAll('.act').forEach(b => { b.disabled = !enabled; });
 }
+document.addEventListener('click', e => {
+  const t = e.target.closest('.doclink');
+  if (t) openDoc(t.dataset.doc);
+});
 tick(); setInterval(tick, 3000);
 </script></body></html>
 """
 
 
 class Handler(BaseHTTPRequestHandler):
-    state_cache: tuple[float, dict] | None = None
+    cache: tuple[float, dict] | None = None
     lock = threading.Lock()
+    token = ""
+
+    def _send(self, body: bytes, ctype: str, code: int = 200) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, data: dict, code: int = 200) -> None:
+        self._send(json.dumps(data, ensure_ascii=False).encode(),
+                   "application/json; charset=utf-8", code)
 
     def do_GET(self):                                  # noqa: N802
         if self.path.startswith("/api/state"):
             with Handler.lock:
                 now = time.time()
-                if Handler.state_cache is None or now - Handler.state_cache[0] > 2.0:
-                    Handler.state_cache = (now, state())
-                payload = Handler.state_cache[1]
-            body = json.dumps(payload, ensure_ascii=False).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-        elif self.path in ("/", "/index.html"):
-            body = PAGE.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-        else:
-            self.send_response(404)
-            body = b"not found"
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+                if Handler.cache is None or now - Handler.cache[0] > 2.0:
+                    Handler.cache = (now, state(Handler.token))
+                payload = Handler.cache[1]
+            self._json(payload)
+            return
+        if self.path.startswith("/api/doc"):
+            name = ""
+            if "?" in self.path:
+                for part in self.path.split("?", 1)[1].split("&"):
+                    if part.startswith("name="):
+                        from urllib.parse import unquote
+                        name = unquote(part[5:])
+            path = doc_path(name)
+            if path is None:
+                self._json({"name": name, "text": ""}, 404)
+                return
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    text = fh.read()
+            except OSError:
+                text = ""
+            self._json({"name": name, "text": text})
+            return
+        if self.path in ("/", "/index.html"):
+            self._send(PAGE.encode(), "text/html; charset=utf-8")
+            return
+        self._send(b"not found", "text/plain; charset=utf-8", 404)
+
+    def do_POST(self):                                # noqa: N802
+        if not self.path.startswith("/api/action"):
+            self._send(b"not found", "text/plain; charset=utf-8", 404)
+            return
+        status = check_token(self.headers.get("X-Panel-Token"), Handler.token)
+        if status != "ok":
+            message = ("действия выключены: нет файла с ключом "
+                       "(~/.assistant/panel.token)" if status == "disabled"
+                       else "неверный ключ")
+            self._json({"ok": False, "message": message}, 403)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(min(length, 4096)) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            payload = {}
+        result = do_action(payload, Handler.token)
+        with Handler.lock:                 # состояние менялось — сбросим кэш
+            Handler.cache = None
+        self._json(result)
 
     def log_message(self, *args):
-        pass                       # не засоряем журнал панели запросами
+        pass                    # не засоряем журнал панели своими запросами
 
 
 def main() -> int:
@@ -462,9 +778,14 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--bind", default="0.0.0.0",
                     help="адрес прослушивания (0.0.0.0 — вся локальная сеть)")
+    ap.add_argument("--token-file", default=TOKEN_FILE,
+                    help="файл с ключом доступа; нет файла — панель только читает")
     args = ap.parse_args()
+    Handler.token = load_token(args.token_file)
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
-    print(f"[panel] http://{args.bind}:{args.port} — панель ассистента", flush=True)
+    print(f"[panel] http://{args.bind}:{args.port} — панель ассистента"
+          + ("" if Handler.token else
+             "; действия выключены (нет файла с ключом)"), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
