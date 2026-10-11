@@ -1,23 +1,21 @@
 [Unit]
-Description=BPI-W3 voice assistant: VAD-trigger loop with resident ASR
-# voiced владеет микрофоном: в один момент времени listens ONLY это устройство.
-# ASR и TTS резидентны — должны быть подняты раньше, иначе сегменты пойдут
+Description=BPI-W3 voice assistant: Vosk-KWS wake word, command capture, resident ASR
+# voiced владеет микрофоном: в один момент времени слушает ТОЛЬКО это устройство.
+# ASR и TTS резидентны — должны быть подняты раньше, иначе команды уйдут
 # файлами в spool без распознавания.
 After=ttsd.service asrd.service
 
 [Service]
-# Микрофон USB: plughw:5,0 (только USB 2.0 порт и только plughw - с hw:
-# устройство отдаёт 11025 Гц и VAD-пайплайн падает).
-# Имя ассистента: «Астра, включи свет». Команда идёт ПОСЛЕ имени, поэтому
-# запись захватывает её целиком — «съеденные» начала фраз уходят вместе с
-# пре-роллом, который нужен теперь только самому имени.
+# Микрофон USB: plughw:5,0 (только plughw — с hw: устройство отдаёт 11025 Гц).
+# Имя сторожит Vosk с грамматикой (см. docs/13-kws.md): на этом микрофоне
+# узнать имя по тексту ASR не удавалось, а грамматика из одного слова
+# срабатывает. VAD больше не нужен: старт команды известен от KWS, конец
+# ловит энергетический детектор.
 ExecStart=%h/models/tts-venv/bin/python %h/bpi-w3-voice-assistant/scripts/voiced.py \
   --device plughw:5,0 \
-  --spool-dir %h/.assistant/segments \
-  --wake-word астра \
-  --awake-timeout 12 \
-  --pre-roll 2.0 \
-  --gain 4.0
+  --kws-model %h/models/vosk-model-small-ru-0.22 \
+  --kws-phrases "астра,астры,эй астра" \
+  --spool-dir %h/.assistant/segments
 Environment=ASR_ADDR=127.0.0.1
 Environment=ASR_PORT=6006
 Restart=on-failure

@@ -1,15 +1,9 @@
-"""Слой ответа ассистента: распознанный текст -> реплика -> озвучка.
+"""assistant.py — тексты ответов, сигнал и озвучка.
 
-ПОЧЕМУ ЗАГЛУШКА. Сейчас ассистент отвечает шаблоном, а место реального
-вызова Home Assistant явно отмечено точкой `stub_intent`: она печатает,
-какой HTTP-запрос будет отправлен, и ничего не отправляет. Когда появится
-долгоживущий токен HA, меняется только эта функция — озвучка, защита от
-эха и журнал остаются как есть.
-
-Озвучка идёт через резидентный TTS-воркер (tts_say.daemon_synth), то есть
-без загрузки torch в процесс прослушки: ответ звучит за ~0.3 с синтеза.
-Если воркера нет — честный фолбэк через say.sh (он сам умеет холодный
-путь), только медленнее.
+Имя ассистента и его распознавание переехали в scripts/kws.py (Vosk с
+грамматикой): на этом микрофоне узнать имя по тексту ASR не удавалось —
+одно короткое слово расслышивается как «Поставь», «Астя», «Остров».
+Здесь остаётся то, что не зависит от того, как имя было услышано.
 """
 
 from __future__ import annotations
@@ -30,139 +24,6 @@ DEFAULT_TEMPLATE = ("Принято: {text}. Отвечаю шаблоном, "
 # удачное: начинается с открытой гласной, поэтому VAD ловит начало раньше,
 # чем на согласной (у «Джарвиса» тихая «дж» — замерено: слово давало всего
 # 7 окон выше порога при нужных 8). Список имён — через запятую.
-DEFAULT_WAKE_WORD = "астра"
-
-# Порог схожести для нечёткого узнавания имени. 0.75 (как было) отклонял
-# реальные попытки: ASR с живым голосом выдал «Астя, включи свет в коридоре»
-# (схожесть 0.667) — и команда терялась целиком. 0.6 принимает весь живой
-# разброс «аст*», но по-прежнему отвергает «прости», «поставь», «эста».
-WAKE_SIMILARITY = 0.6
-
-
-def _norm_words(text: str) -> list[str]:
-    """Слова в нижнем регистре без пунктуации; ё приводится к е."""
-    out, cur = [], []
-    for ch in text.lower().replace("ё", "е"):
-        if ch.isalnum():
-            cur.append(ch)
-        elif cur:
-            out.append("".join(cur))
-            cur = []
-    if cur:
-        out.append("".join(cur))
-    return out
-
-
-def match_wake(text: str, words=None, threshold: float | None = None) -> tuple[bool, str]:
-    """Ищет имя ассистента во фразе: (найдено, остаток-команда).
-
-    Сравнение НЕЧЁТКОЕ (difflib). Причина: VAD может срезать начало слова, а
-    микрофон платы слабый и шумный — ASR слышит «Астры», «Астро», «Аста»,
-    «Астя». Порог 0.6 подобран по живым логам: «астя» (0.667) и «асти» (0.667)
-    узнаются, а «прости» (0.36), «поставь» (0.33), «эста» (0.44) — нет.
-    Жёсткое равенство теряло бы почти все попытки позвать ассистента.
-    Пары соседних слов проверяются тоже: ASR иногда делит имя надвое.
-    """
-    if threshold is None:
-        threshold = WAKE_SIMILARITY
-    if words is None:
-        words = DEFAULT_WAKE_WORD
-    if isinstance(words, str):
-        words = words.split(",")
-    # _norm_words возвращает СПИСОК слов: имя может быть и составным
-    # («эй астра») — тогда достаточно совпадения с любым его словом.
-    targets = [tok for w in words for tok in _norm_words(w)]
-    tokens = _norm_words(text)
-    if not targets or not tokens:
-        return False, ""
-
-    from difflib import SequenceMatcher
-
-    def onset_ok(target: str, cand: str) -> bool:
-        """Если имя начинается с гласной, кандидат тоже должен ею начинаться.
-
-        Порог схожести пришлось опустить до 0.6 (живые «астя»/«асти»), и тогда
-        под него подпадают «мастер» (0.73) и «страна» (0.73). Но «астра»
-        начинается с открытой гласной: VAD может срезать это начало, а вот
-        подменить его согласной ASR не может. Проверка отсекает мусорные
-        совпадения, не теряя реальных.
-        """
-        vowels = "аеёиоуыэюя"
-        return not (target[:1] in vowels) or cand[:1] in vowels
-
-    cands = [(i, i + 1, tok) for i, tok in enumerate(tokens)]
-    cands += [(i, i + 2, tokens[i] + tokens[i + 1])
-              for i in range(len(tokens) - 1)]
-    for start, end, cand in cands:
-        if len(cand) < 4:
-            continue
-        for target in targets:
-            if not onset_ok(target, cand):
-                continue
-            if SequenceMatcher(None, cand, target).ratio() >= threshold:
-                rest = " ".join(tokens[:start] + tokens[end:])
-                return True, rest
-    return False, ""
-
-
-class WakeState:
-    """Сон ассистента по имени с таймаутом ожидания команды.
-
-    Алгоритм (как у колонок): пока не прозвучало имя — ассистент молчит и на
-    распознанный текст не отвечает. Имя услышано -> «бодрствует» timeout
-    секунд и ждёт команду. Команда пришла -> уходит наверх, состояние снова
-    сон. Тишина дольше таймаута -> сон (в журнале видно, что заснул).
-
-    Имя и команда одним вдохом («джарвис, включи свет») -> сразу команда без
-    ожидания: будить и держать таймаут тут незачем.
-
-    Часы инъектируются (clock): тесты проверяют таймаут без реального ожидания.
-    """
-
-    def __init__(self, words=None, timeout: float = 12.0, clock=None,
-                 similarity: float | None = None):
-        import time
-        self.words = words
-        self.timeout = timeout
-        self.similarity = similarity      # None -> WAKE_SIMILARITY
-        self._clock = clock or time.monotonic
-        self._awake_until = 0.0
-
-    @property
-    def awake(self) -> bool:
-        return self._clock() < self._awake_until
-
-    def on_text(self, text: str) -> tuple[str, str]:
-        """Распознанный текст -> ("wake"|"command"|"ignore", нагрузка)."""
-        found, rest = match_wake(text, self.words, self.similarity)
-        if found and rest.strip():
-            self._awake_until = 0.0
-            return "command", rest
-        if found:
-            self._awake_until = self._clock() + self.timeout
-            return "wake", ""
-        if self.awake:
-            self._awake_until = 0.0
-            return "command", text
-        return "ignore", ""
-
-    def wake_up(self) -> None:
-        """Разбудить без совпадения по имени.
-
-        Нужно, когда ASR расслышал короткое слово-имя иначе («Прости»,
-        «Поставь»): ассистент всё равно должен откликнуться на короткое
-        обращение — иначе со слабым микрофоном он не отзывается вовсе.
-        """
-        self._awake_until = self._clock() + self.timeout
-
-    def tick(self) -> bool:
-        """True ровно один раз — в момент засыпания по таймауту."""
-        if self._awake_until and self._clock() >= self._awake_until:
-            self._awake_until = 0.0
-            return True
-        return False
-
-
 def wake_tone(sample_rate: int = 16000, freq: float = 880.0,
               dur: float = 0.12, amp: float = 0.35):
     """Нарастание/спад по краям тона: резкий старт даёт щелчок в колонке."""
@@ -187,33 +48,6 @@ def beep(device: str | None = None) -> int:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     core.write_audio(wake_tone(), path, ogg=False)
     return core.play(path, device=device or core.DEFAULT_DEVICE, timeout=10)
-
-
-def classify_utterance(found_name: bool, speech_s: float, call_min: float,
-                       call_max: float, ignore_without_name: bool = False) -> str:
-    """Что делать с распознанной фразой: "call" | "command" | "ignore".
-
-    Во сне имя почти всегда расслышано иначе («Поставь», «Астя»), а сама команда
-    распознаётся хорошо. Поэтому имя — удобство (сигнал «слушаю»), а не турникет:
-    по умолчанию фраза без имени всё равно выполняется. Флаг
-    --ignore-without-name возвращает строгое поведение (отвечать только по имени).
-    """
-    if found_name:
-        return "command"
-    if call_min <= speech_s <= call_max:
-        return "call"
-    return "ignore" if ignore_without_name else "command"
-
-
-def is_short_call(speech_s: float, limit: float, floor: float = 0.3) -> bool:
-    """Короткая речь в сегменте = оклик, а не фраза.
-
-    Нижняя граница обязательна: щелчок, скрип стула или обрывок звука дают
-    0.15-0.26 с «речи», и без неё ассистент откликался на шум (проверено на
-    живой эксплуатации — «Страшно.» на 0.26 с). Настоящий оклик — 0.38-0.74 с.
-    Верхняя граница отделяет оклик от короткой команды (1.22-1.54 с).
-    """
-    return floor <= speech_s <= limit
 
 
 def make_reply(text: str, template: str = DEFAULT_TEMPLATE) -> str:
@@ -246,36 +80,6 @@ def stub_intent(text: str) -> dict:
     print(f"[intent] заглушка, HTTP-запрос НЕ отправляется: "
           f"{request['method']} {request['path']} {request['json']}", flush=True)
     return request
-
-
-def _words(s: str) -> set:
-    """Слова для сравнения: без регистра и знаков препинания."""
-    out, cur = set(), []
-    for ch in s.lower():
-        if ch.isalnum():
-            cur.append(ch)
-        elif cur:
-            out.add("".join(cur))
-            cur = []
-    if cur:
-        out.add("".join(cur))
-    return out
-
-
-def is_echo(text: str, last_reply: str | None, overlap: float = 0.7) -> bool:
-    """Похоже ли распознанное на нашу же озвученную реплику.
-
-    Защита от самопрослушивания: микрофон и динамик на одной плате, и даже
-    с паузой на время речи хвост колонки может попасть в сегмент. Реплика
-    узнаётся по пересечению слов: если >= overlap слов распознанного есть
-    в предыдущем ответе — это эхо, отвечать на него нельзя (иначе цикл).
-    """
-    if not last_reply:
-        return False
-    said, reply = _words(text), _words(last_reply)
-    if not said:
-        return False
-    return len(said & reply) / len(said) >= overlap
 
 
 def synth_and_play(text: str, voice: str | None = None, device: str | None = None,

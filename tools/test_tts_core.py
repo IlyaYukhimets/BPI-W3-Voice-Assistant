@@ -627,15 +627,6 @@ def test_assistant_reply():
     true("{text}" in assistant.DEFAULT_TEMPLATE,
          "шаблон по умолчанию содержит метку {text}")
 
-    # --- эхо собственной реплики ------------------------------------------
-    reply = "Принято: включить свет в коридоре. Отвечаю шаблоном."
-    true(assistant.is_echo(reply, reply), "точное совпадение — эхо")
-    true(assistant.is_echo("принято включить свет", reply),
-         "эхо узнаётся без регистра и пунктуации")
-    true(not assistant.is_echo("какая погода", reply),
-         "другая фраза эхом не считается")
-    true(not assistant.is_echo(reply, None), "без предыдущего ответа эха нет")
-
     # --- заглушка запроса в HA --------------------------------------------
     req = assistant.stub_intent("включить свет")
     eq(req["method"], "POST", "метод будущего запроса — POST")
@@ -644,218 +635,167 @@ def test_assistant_reply():
     eq(req["json"]["text"], "включить свет", "текст кладётся в тело запроса")
 
 
-def test_gate_flush():
-    """flush() после своей озвучки: эхо динамика не попадает в сегмент."""
+def test_kws_grammar():
+    """Грамматика KWS: список наших форм + [unk] для всего остального."""
+    import json
+
+    import kws
+
+    grammar = json.loads(kws.build_grammar(["астра", "астры"]))
+    eq(grammar, ["астра", "астры", "[unk]"],
+       "грамматика = формы имени + [unk] последним")
+    true("[unk]" in kws.build_grammar(kws.DEFAULT_PHRASES),
+         "по умолчанию [unk] тоже включён: посторонняя речь не считается именем")
+    try:
+        kws.build_grammar(["", "   "])
+        true(False, "пустой список фраз должен отвергаться")
+    except ValueError:
+        true(True, "пустой список фраз отвергается с ошибкой")
+    eq(kws.allowed_words(["астра", "эй астра"]), {"астра", "эй"},
+       "слова грамматики: по ним проверяем срабатывание")
+
+
+def test_kws_spotter():
+    """Сторож имени: срабатывание только по ИТОГОВОМУ тексту, без модели и звука."""
+    import json
+
+    import kws
+
+    class FakeRec:
+        """Заглушка: итоговый текст появляется на заданном кадре (at)."""
+
+        def __init__(self, text, at=3):
+            self.text, self.at, self.fed = text, at, 0
+
+        def AcceptWaveform(self, pcm):
+            self.fed += 1
+            return self.fed == self.at
+
+        def PartialResult(self):
+            # Частичные результаты нарочно «шумные»: сторож обязан их игнорировать.
+            return json.dumps({"partial": "астра"})
+
+        def FinalResult(self):
+            return json.dumps({"text": self.text})
+
+    made = []
+
+    def factory(model, rate, grammar):
+        made.append((rate, grammar))
+        return FakeRec("астра")
+
+    spot = kws.KwsSpotter(phrases=("астра", "астры"), factory=factory)
+    spot.load()
+    # Ложное срабатывание по partial — та самая ошибка живого прогона
+    # (команда дала «имя»), поэтому три кадра до итога молчим.
+    true(not spot.feed(b"\x00\x00" * 512), "partial не считается срабатыванием")
+    true(not spot.feed(b"\x00\x00" * 512), "partial не считается срабатыванием")
+    true(spot.feed(b"\x00\x00" * 512), "итоговый «астра» — срабатывание")
+    eq(spot.hits, 1, "счётчик срабатываний ведётся")
+    eq(len(made), 1, "распознаватель создаётся один раз")
+    eq(json.loads(made[0][1])[-1], "[unk]", "грамматика передана в распознаватель")
+
+    # Посторонняя фраза: итог от грамматики приходит как [unk].
+    made.clear()
+    spot2 = kws.KwsSpotter(phrases=("астра",),
+                           factory=lambda m, r, g: FakeRec("[unk]"))
+    for _ in range(4):
+        true(not spot2.feed(b"\x00\x00" * 512),
+             "чужая фраза (итог [unk]) имя не поднимает")
+
+    # Имя с продолжением фразы в одном итоге («астра включи свет») — срабатываем.
+    spot3 = kws.KwsSpotter(phrases=("астра",),
+                           factory=lambda m, r, g: FakeRec("астра [unk]"))
+    for _ in range(3):
+        spot3.feed(b"\x00\x00" * 512)
+    eq(spot3.hits, 1, "имя внутри итоговой фразы тоже считается срабатыванием")
+
+    # Имя из пре-ролла попадает в текст команды — снимаем его.
+    eq(kws.strip_name("Астра. Свет в коридоре."), "Свет в коридоре.",
+       "имя снимается с начала команды")
+    eq(kws.strip_name("астра включи свет"), "включи свет",
+       "имя без пунктуации тоже снимается")
+    eq(kws.strip_name("включи свет"), "включи свет",
+       "без имени текст не меняется")
+    eq(kws.strip_name("Астра"), "", "одно имя даёт пустую команду")
+
+    spot.reset()
+    spot.feed(b"\x00\x00" * 512)
+    eq(len(made) + 1, 2, "после reset распознаватель создаётся заново")
+
+
+def test_command_recorder():
+    """Детектор конца команды: старт по трём громким кадрам, конец по тишине."""
     import voiced
 
-    cfg = voiced.GateConfig(threshold=0.5, min_speech=0.25, min_silence=0.3,
-                            pre_roll=0.4, sample_rate=16000)
-    gate = voiced.SpeechGate(cfg, prob_fn=lambda x: PROBS[0])
-    w = b"\x00\x00" * voiced.WINDOW_SAMPLES
-    # Набираем полное кольцо пре-ролла и открытый кандидат.
-    PROBS[0] = 0.0
-    for i in range(20):
-        gate.feed(w)
-    PROBS[0] = 0.8
-    for i in range(10):          # min_speech 0.25 с = 8 окон -> триггер
-        gate.feed(w)
-    true(gate._triggered, "перед flush сегмент открыт")
-    gate.flush()
-    eq(len(gate._piece), 0, "flush очищает текущий сегмент")
-    eq(len(gate._ring), 0, "flush очищает кольцо пре-ролла")
-    true(gate._cand_at is None, "flush снимает кандидата")
-    # После flush тишина не даёт сегмента, а речь даёт — и он целый.
-    PROBS[0] = 0.0
+    frame = b"\x00\x00" * voiced.FRAME
+    floor = 100.0
+
+    # Пре-ролл: сегмент обязан начинаться с кадров, снятых ДО сигнала —
+    # ASR нужен «прогрев», иначе теряется первое слово команды.
+    pre = [b"\x01\x00" * voiced.FRAME, b"\x02\x00" * voiced.FRAME]
+    rec = voiced.CommandRecorder(floor, end_silence=0.16, wait_speech=1.0,
+                                 pre_roll=pre)
+    for _ in range(3):
+        rec.feed(frame, floor * 3)
+    true(rec.pcm[:len(pre[0]) * 2] == b"".join(pre),
+         "сегмент начинается с пре-ролла (прогрев ASR)")
+
+    rec = voiced.CommandRecorder(floor, end_silence=0.16, wait_speech=0.16)
+    true(rec.feed(frame, floor) is None, "тишина: ждём начало команды")
     got = None
-    for i in range(30):
-        r = gate.feed(w)
-        if r:
-            got = r
-    true(got is None, "после flush тишина сегмента не даёт")
-    PROBS[0] = 1.0
-    for i in range(12):
-        gate.feed(w)
-    PROBS[0] = 0.0
-    for i in range(30):
-        r = gate.feed(w)
-        if r:
-            got = r
-    true(got is not None, "после flush речь снова распознаётся")
+    for _ in range(20):
+        got = rec.feed(frame, floor) or got
+    true(got is not None and got["status"] == "silence",
+         "если команда не началась — статус silence, цикл вернётся к сторожу")
+
+    # Одиночный громкий кадр старт НЕ открывает: ровно так запись открывалась
+    # на хвосте сигнала после имени, и команда терялась.
+    rec = voiced.CommandRecorder(floor, end_silence=0.16, wait_speech=1.0)
+    rec.feed(frame, floor * 3)
+    true(not rec.started, "один громкий кадр (хвост сигнала) запись не открывает")
+
+    rec = voiced.CommandRecorder(floor, end_silence=0.16, wait_speech=1.0)
+    for _ in range(3):
+        rec.feed(frame, floor * 3)
+    true(rec.started, "три громких кадра подряд открывают запись")
+    got = None
+    for _ in range(10):
+        got = rec.feed(frame, floor) or got
+    true(got is not None and got["status"] == "ok", "пауза закрывает команду")
     if got:
-        # Кольцо после flush успело набрать только тишину: сегмент — это
-        # 0.13 с догоняющей тишины + речь. Эхо реплики (0.4 с = 6400 сэмплов
-        # пре-ролла) дало бы куда больше: 8192 vs ~14600.
-        true(got["samples"] <= int(0.55 * 16000),
-             "в сегменте нет пре-ролла из эха (кольцо очищено flush)")
+        true(got["speech_s"] > 0.0, "длина речи посчитана")
+        true(abs(got["dur_s"] - len(got["pcm"]) / 2 / 16000) < 1e-6,
+             "длина сегмента = длине записанного аудио")
 
+    rec = voiced.CommandRecorder(floor, end_silence=5.0, max_speech=0.32,
+                                 wait_speech=1.0)
+    for _ in range(3):
+        rec.feed(frame, floor * 3)
+    got = None
+    for _ in range(30):
+        got = rec.feed(frame, floor * 3) or got
+    true(got is not None and got["status"] == "long",
+         "длинная речь обрезается по --max-command")
 
-def test_wake_word():
-    """Имя ассистента («Астра»): нечёткое сравнение, таймаут ожидания, сигнал.
+    rec = voiced.CommandRecorder(floor, end_silence=0.32, wait_speech=1.0)
+    for _ in range(3):
+        rec.feed(frame, floor * 3)
+    got = rec.feed(frame, floor * 1.5)
+    true(got is None, "громкость между порогами не закрывает команду (гистерезис)")
 
-    Смысл нечёткости: VAD может срезать начало слова, и ASR слышит «стра»
-    вместо «астра». Жёсткое равенство теряло бы и пробуждение, и всю команду —
-    поэтому сравнение по difflib с порогом, а не по строке.
-    """
-    import assistant
-
-    found, rest = assistant.match_wake("Астра, включи свет в коридоре.")
-    true(found, "имя в начале фразы узнаётся")
-    eq(rest, "включи свет в коридоре", "остаток фразы — это команда")
-
-    found, rest = assistant.match_wake("Астра.")
-    true(found and rest == "", "одинокое имя — только пробуждение")
-
-    # Срезанное ДО СОГЛАСНОЙ («стра») намеренно НЕ узнаётся: от «страна» и
-    # «мастер» его ничем не отличить, а ложные пробуждения мешают сильнее.
-    # Такие попытки ловит эвристика короткого обращения (--call-max-speech).
-    found, _ = assistant.match_wake("стра, включи свет")
-    true(not found, "«стра» не путается со «страна»/«мастер»")
-
-    found, _ = assistant.match_wake("Астры, который час?")
-    true(found, "форма слова от ASR («астры») узнаётся")
-
-    # Порог 0.6 подобран по живым логам пользователя: ASR слышал имя как
-    # «Астя»/«Асти», и при прежнем пороге 0.75 команда терялась целиком.
-    found, rest = assistant.match_wake("Астя, включи свет в коридоре.")
-    true(found, "живое «астя» (0.667) узнаётся — с порогом 0.75 терялось")
-    eq(rest, "включи свет в коридоре", "и команда при этом сохраняется")
-
-    found, rest = assistant.match_wake("включи свет, астра")
-    true(found, "имя в конце фразы тоже узнаётся")
-    eq(rest, "включи свет", "команда остаётся без имени")
-
-    found, _ = assistant.match_wake("включить свет в коридоре")
-    true(not found, "обычная команда без имени пробуждением не считается")
-    found, _ = assistant.match_wake("компьютер, выключи музыку")
-    true(not found, "другое слово не считается именем")
-    # Порог 0.6 пустил бы «мастер» (0.73) и «страна» (0.73): их отсекает
-    # проверка начала слова — имя начинается с гласной, и кандидат тоже обязан.
-    found, _ = assistant.match_wake("мастер, привет")
-    true(not found, "«мастер» (0.73) отсекается проверкой гласного начала")
-    found, _ = assistant.match_wake("В стране сегодня дождь")
-    true(not found, "«стране» (0.73) тоже не срабатывает")
-    found, _ = assistant.match_wake("")
-    true(not found, "пустой текст — не имя")
-
-    # --- состояние: сон -> пробуждение -> команда -> таймаут ---------------
-    clock = {"t": 1000.0}
-    st = assistant.WakeState(words="астра", timeout=12.0,
-                             clock=lambda: clock["t"])
-    eq(st.on_text("включить свет в коридоре")[0], "ignore",
-       "пока не позвали — молчим")
-    eq(st.on_text("Астра")[0], "wake", "имя будит ассистента")
-    true(st.awake, "после имени ассистент бодрствует")
-    clock["t"] += 5.0
-    eq(st.on_text("а теперь выключи свет")[0], "command",
-       "в пределах таймаута фраза принимается как команда")
-    true(not st.awake, "после команды ассистент снова спит")
-    eq(st.on_text("ещё одна фраза")[0], "ignore",
-       "без имени следующая фраза игнорируется")
-
-    # Одним вдохом: имя + команда в одной фразе.
-    eq(st.on_text("Астра, который час")[0], "command",
-       "имя с командой в одной фразе сразу идёт командой")
-
-    # Таймаут: имя было, команды не последовало.
-    st.on_text("Астра")
-    true(not st.tick(), "таймаут не истёк — не засыпаем")
-    clock["t"] += 13.0
-    true(st.tick(), "по истечении таймаута ассистент засыпает")
-    true(not st.tick(), "засыпание сообщается один раз")
-    true(not st.awake, "после таймаута состояние — сон")
-    eq(st.on_text("Астра, включи свет")[0], "command",
-       "после сна имя снова работает")
-
-    # Короткое обращение, расслышанное иначе: будим без совпадения по имени.
-    eq(st.on_text("Прости.")[0], "ignore",
-       "незнакомый текст сам по себе не будит")
-    st.wake_up()
-    true(st.awake, "wake_up() будит без совпадения по имени")
-    eq(st.on_text("включи свет")[0], "command",
-       "после такого пробуждения команда принимается")
-    true(not st.awake, "и состояние снова сон")
-
-
-    # Имя — удобство, а не турникет: на слабом микрофоне оно почти всегда
-    # расслышано иначе, поэтому команду без имени всё равно выполняем.
-    eq(assistant.classify_utterance(False, 1.4, 0.3, 1.0), "command",
-       "команда без имени выполняется (иначе она терялась)")
-    eq(assistant.classify_utterance(False, 1.4, 0.3, 1.0,
-                                    ignore_without_name=True), "ignore",
-       "строгий режим по флагу возвращает прежнее поведение")
-    eq(assistant.classify_utterance(False, 0.45, 0.3, 1.0), "call",
-       "короткая речь — оклик, даже без имени")
-    eq(assistant.classify_utterance(False, 0.26, 0.3, 1.0), "command",
-       "щелчок 0.26 с не оклик; фраза уходит как команда")
-    eq(assistant.classify_utterance(True, 1.4, 0.3, 1.0), "command",
-       "имя в фразе — это команда, а не оклик")
-    eq(assistant.classify_utterance(True, 0.5, 0.3, 1.0), "command",
-       "имя распознано — фразу обрабатываем как команду")
-
-    # Быстрый оклик: по длине речи решаем, что это имя, а не фраза — сигнал
-    # даётся сразу, ASR для него не нужен (иначе отклик опаздывает на 1-2 с).
-    true(assistant.is_short_call(0.38, 1.0), "одно слово — оклик")
-    true(not assistant.is_short_call(1.22, 1.0), "короткая команда — уже не оклик")
-    true(not assistant.is_short_call(0.0, 1.0), "тишину окликом не считаем")
-    true(not assistant.is_short_call(2.5, 1.0), "длинная фраза — не оклик")
-    # Нижняя граница: щелчок/скрип/обрывок дают 0.15-0.26 с «речи». Без неё
-    # ассистент откликался на посторонний шум (живая эксплуатация, «Страшно.»).
-    true(not assistant.is_short_call(0.26, 1.0), "щелчок 0.26 с — не оклик")
-    true(assistant.is_short_call(0.26, 1.0, floor=0.2),
-         "нижняя граница настраивается")
-
-    # Уровень сегмента: отличает «звука не было» от «ASR не расслышал».
-    import voiced
-    quiet = struct.pack("<4h", 0, 3, -2, 1)
-    loud = struct.pack("<4h", 0, 30000, -12345, 1)
-    true(voiced.peak_db(quiet) < -60.0, "тишина даёт очень низкий уровень")
-    true(voiced.peak_db(loud) > -3.0, "громкий сегмент — около нуля дБ")
-    true(voiced.peak_db(b"") < -60.0, "пустой сегмент не ломает расчёт")
-
-    # --- сигнал пробуждения: тон с плавными краями -------------------------
-    tone = assistant.wake_tone(sample_rate=16000, dur=0.12)
-    eq(len(tone), int(16000 * 0.12), "длина сигнала = длительность x частоту")
-    true(abs(float(abs(tone).max()) - 0.35) < 0.02, "амплитуда в пределах")
-    true(abs(float(tone[0])) < 0.02 and abs(float(tone[-1])) < 0.02,
-         "края сигнала на нуле — без щелчка в колонке")
-    true(float(abs(tone).max()) > 0.3, "сигнал не вырожден")
-
-def test_gate_speech_length():
-    """Сегмент сообщает длину РЕЧИ: по ней отличаем «позвали» от фразы."""
-    import voiced
-
-    cfg = voiced.GateConfig(threshold=0.5, min_speech=0.15, min_silence=0.3,
-                            pre_roll=0.4, sample_rate=16000)
-    gate = voiced.SpeechGate(cfg, prob_fn=lambda x: PROBS[0])
-    w = b"\x00\x00" * voiced.WINDOW_SAMPLES
-
-    def run(hot_windows):
-        PROBS[0] = 0.0
-        for _ in range(10):
-            gate.feed(w)
-        PROBS[0] = 0.9
-        for _ in range(hot_windows):
-            gate.feed(w)
-        PROBS[0] = 0.0
-        got = None
-        for _ in range(30):
-            r = gate.feed(w)
-            if r:
-                got = r
-        return got
-
-    short = run(6)      # ~одно короткое слово
-    true(short is not None, "короткое обращение закрылось сегментом")
-    if short:
-        true(short["speech"] <= 0.3,
-             f"речь короткого слова ≈ {short['speech']:.2f} с")
-    long_ = run(40)     # длинная фраза
-    true(long_ is not None, "длинная фраза закрылась сегментом")
-    if long_:
-        true(long_["speech"] > 1.0,
-             f"речь длинной фразы ≈ {long_['speech']:.2f} с")
-        true(long_["speech"] > short["speech"],
-             "длина речи различает обращение и фразу")
+    # Шумная комната: пол высокий, но команда закрывается по падению
+    # относительно ПИКА речи — иначе запись шла до --max-command (было на живом
+    # прогоне: сегмент 15 с, «речь 15 с»).
+    loud_floor = 3000.0
+    rec = voiced.CommandRecorder(loud_floor, end_silence=0.16, wait_speech=1.0)
+    for _ in range(3):
+        rec.feed(frame, loud_floor * 3)
+    got = None
+    for _ in range(12):
+        got = rec.feed(frame, loud_floor * 0.5) or got
+    true(got is not None and got["status"] == "ok",
+         "в шумной комнате команда закрывается по падению от пика речи")
 
 
 def main() -> int:
@@ -864,9 +804,9 @@ def main() -> int:
                test_sentence_split, test_pitch_contour_labels,
                test_humanize_question, test_question_split,
                test_accusative_detection, test_resolve_threads,
-               test_worker_protocol, test_worker_framing, test_voiced_gate,
-               test_assistant_reply, test_gate_flush, test_wake_word,
-               test_gate_speech_length, test_mono_from_bytes):
+               test_worker_protocol, test_worker_framing,
+               test_assistant_reply, test_mono_from_bytes,
+               test_kws_grammar, test_kws_spotter, test_command_recorder):
         fn()
 
     print(f"пройдено проверок: {PASSED}")
