@@ -8,10 +8,15 @@ After=ttsd.service asrd.service
 [Service]
 # Микрофон USB: plughw:5,0 (только USB 2.0 порт и только plughw - с hw:
 # устройство отдаёт 11025 Гц и VAD-пайплайн падает).
+# Имя ассистента: «Астра, включи свет». Команда идёт ПОСЛЕ имени, поэтому
+# запись захватывает её целиком — «съеденные» начала фраз уходят вместе с
+# пре-роллом, который нужен теперь только самому имени.
 ExecStart=%h/models/tts-venv/bin/python %h/bpi-w3-voice-assistant/scripts/voiced.py \
   --device plughw:5,0 \
   --spool-dir %h/.assistant/segments \
-  --pre-roll 1.5 \
+  --wake-word астра \
+  --awake-timeout 12 \
+  --pre-roll 2.0 \
   --gain 4.0
 Environment=ASR_ADDR=127.0.0.1
 Environment=ASR_PORT=6006

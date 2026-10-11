@@ -81,6 +81,25 @@ def gain_pcm16(samples: bytes, gain: float) -> bytes:
     return np.clip(x, -32768, 32767).astype(np.int16).tobytes()
 
 
+def normalize_pcm16(samples: bytes, target: float = 0.7, floor: int = 64) -> bytes:
+    """Нормализация сегмента по пику ПЕРЕД ASR (как norm -3 в ручном пайплайне).
+
+    Зачем: ASR на тихом сегменте ошибается. Замерено на записях с микрофона
+    платы — имя «Астра», произнесённое динамиком:
+        фиксированный гейн x4: 'Эстро' / 'Остя.'
+        нормализация по пику:  'Австра' / 'Астя.'   <- имя уже узнаётся
+    Порог floor защищает от раздувания тишины: шум комнаты не превращается в
+    громкий сигнал, и ложные сегменты остаются пустыми.
+    """
+    import numpy as np
+    x = np.frombuffer(samples, dtype=np.int16)
+    peak = int(np.abs(x).max()) if len(x) else 0
+    if peak < floor:
+        return samples
+    y = x.astype(np.float32) * (target * 32767.0 / peak)
+    return np.clip(y, -32768, 32767).astype(np.int16).tobytes()
+
+
 async def recognize(payload: bytes, addr: str, port: int) -> str:
     """Отправить фреймы и получить одну строку результата."""
     import websockets

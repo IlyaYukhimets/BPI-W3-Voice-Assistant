@@ -40,7 +40,7 @@
 9. [Синтез речи (TTS)](docs/09-tts.md)
 10. [Настройка голоса и интонации](docs/10-voice-tuning.md)
 11. [Резидентные службы (TTS-воркер и ASR-сервер)](docs/11-daemon.md)
-12. [Триггер-цикл (микрофон -> VAD -> ASR -> голосовой ответ)](docs/12-voiced.md)
+12. [Триггер-цикл (микрофон -> VAD -> ASR -> голосовой ответ)](docs/12-voiced.md (там же: `scripts/segment-report.py` — замер качества микрофона по сохранённым сегментам))
 
 ## Быстрый старт
 
@@ -63,8 +63,10 @@ bash scripts/install-deps.sh
 # Резидентные службы: модель TTS и ASR в памяти, реплика за 0.2–0.5 с
 cp systemd/*.service ~/.config/systemd/user/ && systemctl --user daemon-reload
 systemctl --user enable --now ttsd asrd
-# Триггер-цикл: слушает микрофон, отвечает голосом (шаблон-заглушка вместо HA)
+# Триггер-цикл: просыпается на имя, отвечает голосом (шаблон-заглушка вместо HA)
 systemctl --user enable --now voiced
+# Обращение: «Астра» -> короткий сигнал -> «включи свет» -> ответ.
+# Другое имя: voiced --wake-word "орион"; ожидание команды: --awake-timeout 12.
 ```
 
 ## Подбор голоса
