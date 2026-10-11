@@ -748,6 +748,9 @@ def test_command_recorder():
         got = rec.feed(frame, floor) or got
     true(got is not None and got["status"] == "silence",
          "если команда не началась — статус silence, цикл вернётся к сторожу")
+    if got:
+        true("max_rms" in got and got["max_rms"] > 0,
+             "в отчёте есть максимум громкости: по нему видно запас до порога")
 
     # Одиночный громкий кадр старт НЕ открывает: ровно так запись открывалась
     # на хвосте сигнала после имени, и команда терялась.

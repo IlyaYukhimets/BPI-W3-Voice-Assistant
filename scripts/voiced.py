@@ -169,10 +169,12 @@ class CommandRecorder:
         self.silence = 0.0
         self.speech_frames = 0
         self.peak = 0.0          # самый громкий кадр команды
+        self.max_wait = 0.0      # максимум громкости за время ожидания
 
     def feed(self, pcm: bytes, rms: float) -> dict | None:
         """None — пишем дальше; dict — готово (status: ok|long|silence)."""
         if not self.started:
+            self.max_wait = max(self.max_wait, rms)
             self.history.append(rms)
             del self.history[:-self.start_frames]
             loud = sum(self.history) >= (self.floor * self.start_factor
@@ -183,7 +185,8 @@ class CommandRecorder:
                 self.waited += self.frame / self.rate
                 if self.waited >= self.wait_speech:
                     return {"status": "silence", "pcm": b"", "speech_s": 0.0,
-                            "dur_s": 0.0}
+                            "dur_s": 0.0,
+                            "max_rms": max(self.peak, self.max_wait)}
                 return None
         self.pcm.extend(pcm)
         self.peak = max(self.peak, rms)
@@ -203,7 +206,8 @@ class CommandRecorder:
     def _done(self, status: str) -> dict:
         return {"status": status, "pcm": bytes(self.pcm),
                 "speech_s": self.speech_frames * self.frame / self.rate,
-                "dur_s": len(self.pcm) / 2 / self.rate}
+                "dur_s": len(self.pcm) / 2 / self.rate,
+                "max_rms": max(self.peak, self.max_wait)}
 
 
 # ---------------------------------------------------------------------------
@@ -232,13 +236,14 @@ def main() -> int:
                          "чтобы считаться паузой (страховка для шумной комнаты)")
     ap.add_argument("--end-silence", type=float, default=0.8,
                     help="пауза, закрывающая команду (с)")
-    ap.add_argument("--wait-speech", type=float, default=3.5,
+    ap.add_argument("--wait-speech", type=float, default=5.0,
                     help="сколько ждать начала команды после сигнала (с)")
     ap.add_argument("--max-command", type=float, default=15.0,
                     help="максимальная длина команды (с)")
-    ap.add_argument("--start-factor", type=float, default=2.5,
+    ap.add_argument("--start-factor", type=float, default=1.8,
                     help="во сколько раз кадр должен быть громче шума, чтобы "
-                         "считать его началом команды")
+                         "считать его началом команды. 2.5 требовало почти "
+                         "крика в микрофон — с расстояния запись не начиналась")
     ap.add_argument("--no-asr", action="store_true",
                     help="только писать сегменты в spool (для отладки)")
     ap.add_argument("--no-reply", action="store_true",
@@ -298,6 +303,7 @@ def main() -> int:
     recorder: CommandRecorder | None = None
     noise_hist: deque[float] = deque(maxlen=62)   # ~2 с: из них берём пол
     pre_roll: deque[bytes] = deque(maxlen=16)     # 0.5 с перед командой
+    level_hist: deque[float] = deque(maxlen=94)   # 3 с: громкость имени
     floor_rms = 0.0          # шумовой пол (20-й процентиль истории)
     counter = 0
 
@@ -331,9 +337,17 @@ def main() -> int:
                 ordered = sorted(noise_hist)
                 floor_rms = ordered[len(ordered) // 5]
                 pre_roll.append(chunk)
+                level_hist.append(rms)
                 if spot.feed(chunk):
+                    # Громкость САМОГО имени (последние 1.3 с): по ней видно,
+                    # с какого расстояния человек говорит. Разговор в микрофон
+                    # на этой плате даёт пик -14 дБ, с расстояния — заметно тише,
+                    # и распознаванию команды нужен запас.
+                    name_db = 20 * math.log10(
+                        max(1.0, max(level_hist) if level_hist else 1.0) / 32767.0)
                     print(f"[kws] услышал имя ({spot.frames} кадров прослушано, "
-                          f"срабатываний {spot.hits})", flush=True)
+                          f"срабатываний {spot.hits}, громкость имени "
+                          f"{name_db:.0f} дБ)", flush=True)
                     # Сигнал не должен попасть в запись команды. Порядок важен:
                     # СЛИВАЕМ накопленное ДО сигнала, тогда во время сигнала в
                     # трубе оказывается ровно его собственное аудио — и его
@@ -360,13 +374,16 @@ def main() -> int:
                     spot.reset()
                 continue
 
+            recorder_floor = recorder.floor
             got = recorder.feed(chunk, rms)
             if got is None:
                 continue
             recorder = None
             if got["status"] == "silence":
-                print(f"[kws] команды не последовало за {args.wait_speech:g} с",
-                      flush=True)
+                # Цифры, а не «не последовало»: по ним видно ЗАПАС до порога.
+                print(f"[kws] команды не последовало за {args.wait_speech:g} с "
+                      f"(шум {recorder_floor:.0f}, громче всего {got['max_rms']:.0f}, "
+                      f"порог {recorder_floor * args.start_factor:.0f})", flush=True)
                 continue
 
             counter += 1
