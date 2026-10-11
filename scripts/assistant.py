@@ -117,7 +117,7 @@ def wake_tone(kind: str = DEFAULT_WAKE_TONE, sample_rate: int = 16000):
 # Свои сигналы: сюда кладутся файлы (например, озвучка «Слушаю» из make-cue.py).
 # Сигналом может быть и встроенная отбивка, и готовый файл — цикл не различает.
 CUE_DIR = os.path.expanduser("~/.assistant/cues")
-CUE_SUFFIXES = (".ogg", ".wav", ".flac")
+CUE_SUFFIXES = (".ogg", ".wav", ".flac", ".oga")
 CUE_SECONDS = 0.7            # до какой длины обрезать файл сигнала
 
 
@@ -156,6 +156,81 @@ def cue_source(value: str) -> str | None:
 def cue_ok(value: str) -> bool:
     """Годится ли значение `--wake-tone`: встроенный вариант или существующий файл."""
     return value in WAKE_TONES or cue_source(value) is not None
+
+
+def decode_with_sox(path: str):
+    """Прочитать файл, который не понял soundfile.
+
+    Чужая запись часто оказывается не тем, чем выглядит: в каталоге сигналов лежал
+    «close.ogg» — контейнер Ogg с ВИДЕО Theora и звуковой дорожкой внутри.
+    soundfile такое не открывает («unimplemented format»), а sox читает и отдаёт
+    звук. Поэтому второй попыткой идём через sox (он есть на плате и понимает
+    больше форматов), а WAV разбираем стандартным `wave` — без новых зависимостей.
+    """
+    try:
+        out = subprocess.run(["sox", path, "-b", "16", "-t", "wav", "-"],
+                             capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0 or not out.stdout:
+        return None
+    return wav_bytes_to_samples(out.stdout)
+
+
+def wav_bytes_to_samples(raw: bytes):
+    """Разобрать WAV из памяти: (данные, частота) или None, если формат не тот.
+
+    Отдельной функцией, потому что это единственное место, где мы разбираем аудио
+    сами (всё остальное делает soundfile): так её можно проверить тестом, не имея
+    ни sox, ни звуковой библиотеки.
+    """
+    import io
+    import wave
+
+    import numpy as np
+
+    try:
+        with wave.open(io.BytesIO(raw), "rb") as handle:
+            rate = handle.getframerate()
+            if handle.getsampwidth() != 2:
+                return None
+            channels = handle.getnchannels()
+            frames = handle.readframes(handle.getnframes())
+    except (wave.Error, EOFError):
+        return None
+    data = np.frombuffer(frames, dtype="<i2").astype("float32") / 32768.0
+    if channels > 1:
+        data = data.reshape(-1, channels)
+    return data, rate
+
+
+def decode_audio(path: str):
+    """Звук файла: soundfile, а если формат ему не по зубам — через sox."""
+    try:
+        import soundfile as sf
+
+        return sf.read(path, always_2d=True)
+    except Exception:                     # noqa: BLE001 — причину смотрим ниже
+        got = decode_with_sox(path)
+    if got is None:
+        raise ValueError(f"{os.path.basename(path)}: не читается как звук — "
+                         f"нужен ogg/wav/flac либо формат, который понимает sox")
+    return got
+
+
+def cue_duration(path: str) -> float:
+    """Длительность файла: из заголовка (soundfile), иначе спрашиваем у sox."""
+    try:
+        import soundfile as sf
+
+        return float(sf.info(path).duration)
+    except Exception:                     # noqa: BLE001 — см. decode_with_sox
+        pass
+    try:
+        out = subprocess.run(["soxi", "-D", path], capture_output=True, timeout=30)
+        return float(out.stdout.decode().strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0.0
 
 
 def trim_cue(data, rate: int, seconds: float = CUE_SECONDS):
@@ -206,7 +281,7 @@ def prepare_cue(value: str = DEFAULT_WAKE_TONE, seconds: float = CUE_SECONDS,
 
     import soundfile as sf
 
-    data, rate = sf.read(source, always_2d=True)
+    data, rate = decode_audio(source)
     samples = trim_cue(data, rate, seconds)
     sf.write(prepared, samples, rate, subtype="PCM_16")
     return len(samples) / rate
@@ -223,11 +298,9 @@ def tone_seconds(kind: str = DEFAULT_WAKE_TONE, sample_rate: int = 16000,
     source = cue_source(kind)
     if source is None:
         return len(wake_tone(kind, sample_rate)) / sample_rate
-    import soundfile as sf
-
     # Длину берём из заголовка, не читая файл целиком: если запись длиннее
     # отведённого, играть будет ровно обрезанную часть.
-    return min(sf.info(source).duration, seconds)
+    return min(cue_duration(source) or seconds, seconds)
 
 
 def beep(device: str | None = None, kind: str = DEFAULT_WAKE_TONE,

@@ -234,8 +234,11 @@ def main() -> int:
                     default=assistant.CUE_SECONDS,
                     help="сколько играть от файла сигнала (встроенные отбивки "
                          "короче и обрезаются сами)")
+    ap.add_argument("--wake-cue-close", default="-",
+                    help="сигнал, когда имя услышано, а команды не вышло (файл "
+                         "или встроенная отбивка; «-» — молчать)")
     ap.add_argument("--no-wake-beep", action="store_true",
-                    help="не играть сигнал после имени")
+                    help="не играть сигналы совсем (ни открывающий, ни закрывающий)")
     ap.add_argument("--beep-tail-frames", type=int, default=6,
                     help="сколько кадров после сигнала выбросить (6 = 0.19 с — "
                          "длительность самого сигнала и его хвост; больше "
@@ -273,11 +276,15 @@ def main() -> int:
 
     # Модель грузим сразу: без неё цикл бессмысленен, и падать лучше на старте
     # (systemd покажет причину в журнале), чем посреди работы.
-    if not assistant.cue_ok(args.wake_tone):
-        print(f"сигнал {args.wake_tone!r} не годится: нет ни такого файла, ни "
-              f"встроенного варианта ({', '.join(assistant.WAKE_TONES)}), "
-              f"свои файлы кладутся в {assistant.CUE_DIR}", file=sys.stderr)
-        return 2
+    for flag, value in (("--wake-tone", args.wake_tone),
+                        ("--wake-cue-close", args.wake_cue_close)):
+        if value in ("", "-") and flag == "--wake-cue-close":
+            continue                      # закрывающий сигнал можно выключить
+        if not assistant.cue_ok(value):
+            print(f"сигнал {value!r} ({flag}) не годится: нет ни такого файла, ни "
+                  f"встроенного варианта ({', '.join(assistant.WAKE_TONES)}), "
+                  f"свои файлы кладутся в {assistant.CUE_DIR}", file=sys.stderr)
+            return 2
 
     spot = kws.KwsSpotter(model_dir=args.kws_model, phrases=phrases)
     try:
@@ -302,6 +309,38 @@ def main() -> int:
         frame = bytes(pending[:FRAME_BYTES])
         del pending[:FRAME_BYTES]
         return frame
+
+    def cue(value: str, seconds: float, role: str = "") -> None:
+        """Сигнал в колонку — и выброс его звука из микрофона.
+
+        Порядок важен: СЛИВАЕМ накопленное ДО сигнала, тогда во время сигнала в
+        трубе оказывается ровно его собственное аудио, и его же выбрасываем.
+        Число кадров считаем от РЕАЛЬНОЙ длины сигнала (assistant.tone_seconds),
+        а не от фиксированного числа: недобор оставлял сигнал в записи команды,
+        а слив «на всё» после сигнала съедал её начало (замерено: сегмент 1.1 с
+        вместо 1.5 — терялось «Включи»).
+
+        Так же гасится и сигнал-запись: иначе закрывающая фраза попала бы в
+        сторож имени, и он мог бы «услышать» имя в собственном звуке.
+        """
+        drain()
+        if args.no_wake_beep or value in ("", "-"):
+            return
+        if role:
+            # Закрывающий сигнал иначе не виден в журнале: строка про «команды не
+            # последовало» говорит о записи, а не о том, что звук сыграл.
+            print(f"[kws] {role} сигнал {os.path.basename(value)} "
+                  f"({assistant.tone_seconds(value, seconds=seconds):.2f} с)",
+                  flush=True)
+        rc = assistant.beep(kind=value, seconds=seconds)
+        if rc != 0:
+            print(f"[kws] сигнал {value} не проигрался (aplay rc={rc})", flush=True)
+        tail = max(args.beep_tail_frames, math.ceil(
+            (assistant.tone_seconds(value, seconds=seconds) + 0.12)
+            * SAMPLE_RATE / FRAME))
+        for _ in range(tail):
+            if read_frame() is None:
+                break
 
     def drain(limit_frames: int = 200) -> int:
         """Выбросить всё, что уже накопилось (для сигнала — точная граница)."""
@@ -367,34 +406,8 @@ def main() -> int:
                     print(f"[kws] услышал имя ({spot.frames} кадров прослушано, "
                           f"срабатываний {spot.hits}, громкость имени "
                           f"{name_db:.0f} дБ)", flush=True)
-                    # Сигнал не должен попасть в запись команды. Порядок важен:
-                    # СЛИВАЕМ накопленное ДО сигнала, тогда во время сигнала в
-                    # трубе оказывается ровно его собственное аудио — и его
-                    # выбрасываем ровно на длину сигнала (--beep-tail-frames).
-                    # Слив после сигнала «на всё» съедал начало команды, если
-                    # Vosk закрыл фразу позже (замерено: сегмент 1.1 с вместо
-                    # 1.5 — терялось «Включи»).
-                    drain()
-                    if not args.no_wake_beep:
-                        rc = assistant.beep(kind=args.wake_tone,
-                                            seconds=args.wake_cue_seconds)
-                        if rc != 0:
-                            print(f"[kws] сигнал не проигрался (aplay rc={rc})",
-                                  flush=True)
-                    # Сколько кадров выбросить: длина сигнала плюс запас на
-                    # запуск aplay и путь звука до микрофона. Считаем из самого
-                    # сигнала — иначе длину отбивки и число кадров пришлось бы
-                    # согласовывать руками, а рассогласование кладёт тон внутрь
-                    # записи команды. Флаг --beep-tail-frames остаётся нижней
-                    # границей (запас на медленный старт aplay).
-                    tail = max(args.beep_tail_frames, math.ceil(
-                        (assistant.tone_seconds(
-                            args.wake_tone,
-                            seconds=args.wake_cue_seconds) + 0.12)
-                        * SAMPLE_RATE / FRAME))
-                    for _ in range(tail):
-                        if read_frame() is None:
-                            break
+                    # Открывающий сигнал: «слушаю, говори».
+                    cue(args.wake_tone, args.wake_cue_seconds)
                     recorder = CommandRecorder(
                         floor_rms, end_silence=args.end_silence,
                         wait_speech=args.wait_speech,
@@ -415,6 +428,7 @@ def main() -> int:
                 print(f"[kws] команды не последовало за {args.wait_speech:g} с "
                       f"(шум {recorder_floor:.0f}, громче всего {got['max_rms']:.0f}, "
                       f"порог {recorder_floor * args.start_factor:.0f})", flush=True)
+                cue(args.wake_cue_close, args.wake_cue_seconds, role="закрывающий")
                 continue
 
             counter += 1
@@ -443,6 +457,7 @@ def main() -> int:
                 # Запись оставляем в spool для разбора, распознавание не зовём.
                 print(f"[kws] в записи почти нет речи ({got['speech_s']:.2f} с) — "
                       f"похоже на шум, пропускаю", flush=True)
+                cue(args.wake_cue_close, args.wake_cue_seconds, role="закрывающий")
                 continue
             if args.no_asr:
                 continue
@@ -454,6 +469,7 @@ def main() -> int:
             if not text.strip():
                 print(f"[asr] {counter}: не расслышал ({asr_s:.2f} с, "
                       f"пик {peak_db(got['pcm']):.0f} дБ) — повторите", flush=True)
+                cue(args.wake_cue_close, args.wake_cue_seconds, role="закрывающий")
                 continue
             print(f"{counter}: {text}  [ASR {asr_s:.2f} с]", flush=True)
             if args.no_reply:

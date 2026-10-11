@@ -715,6 +715,40 @@ def test_cue_file_seconds():
                 sys.modules["soundfile"] = real
 
 
+def test_wav_bytes_to_samples():
+    """Разбор WAV из памяти: этим путём читаются файлы, которых не понял soundfile."""
+    import io
+    import wave
+    import numpy as np
+    import assistant
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as handle:
+        handle.setnchannels(2)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(np.array([[16000, -16000], [8000, 0]] * 100,
+                                    dtype="<i2").tobytes())
+    got = assistant.wav_bytes_to_samples(buf.getvalue())
+    true(got is not None, "WAV разобран")
+    data, rate = got
+    eq(rate, 16000, "частота взята из заголовка")
+    eq(data.shape, (200, 2), "стерео осталось двумя колонками, 200 кадров")
+    true(abs(float(data[0][0]) - 0.488) < 0.01,
+         "отсчёты переведены в диапазон -1..1")
+
+    mono8 = io.BytesIO()
+    with wave.open(mono8, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(1)
+        handle.setframerate(8000)
+        handle.writeframes(b"\x80" * 10)
+    eq(assistant.wav_bytes_to_samples(mono8.getvalue()), None,
+       "не 16-битный WAV не берём: иначе получилась бы каша")
+    eq(assistant.wav_bytes_to_samples(b"not a wav"), None,
+       "мусор вместо файла не роняет программу")
+
+
 def test_voiced_constants():
     """Имена, к которым обращается цикл, должны существовать у своих модулей.
 
@@ -1056,6 +1090,17 @@ def test_panel_parse():
        "и читается обратно уже новое значение")
     true("--device plughw:5,0" in patched, "остальные ключи не тронуты")
 
+    # Второй сигнал (после тишины): файл и «выключено» — то же значение «-».
+    close_unit = panel.set_option_in_text(unit, "--wake-cue-close", "close.ogg")
+    eq(panel.exec_option(close_unit, "--wake-cue-close"), "close.ogg",
+       "закрывающий сигнал прописан и читается обратно")
+    eq(panel.exec_option(panel.set_option_in_text(close_unit, "--wake-cue-close",
+                                                  "-"), "--wake-cue-close"), "-",
+       "«тишина» — это значение «-», а не пустая строка (иначе argparse упал бы)")
+    import assistant as assistant_mod
+    true(not assistant_mod.cue_ok("-"),
+         "«-» — не файл и не отбивка: это выключенный сигнал")
+
     without = unit.replace("  --wake-tone chime \\\n", "")
     added = panel.set_option_in_text(without, "--wake-tone", "bell")
     true("--wake-tone bell" in added, "нет ключа — он добавляется в ExecStart")
@@ -1116,7 +1161,8 @@ def main() -> int:
                test_accusative_detection, test_resolve_threads,
                test_worker_protocol, test_worker_framing,
                test_assistant_reply, test_mono_from_bytes,
-               test_trim_cue, test_cue_files, test_cue_file_seconds,
+               test_wav_bytes_to_samples, test_trim_cue, test_cue_files,
+               test_cue_file_seconds,
                test_voiced_constants, test_wake_tones, test_beep_plays_once,
                test_kws_grammar, test_kws_spotter,
                test_command_recorder,
