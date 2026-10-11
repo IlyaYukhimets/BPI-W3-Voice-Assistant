@@ -664,6 +664,68 @@ def test_trim_cue():
        "тихий сигнал не подтягивается вверх: иначе он станет громким")
 
 
+def test_trim_cue_silence():
+    """Тишина по краям файла не тратит окно после сигнала.
+
+    Живой случай: у open.ogg звук кончался заметно раньше файла (в хвосте тишина),
+    слив кадров считался по длине файла — и начало фразы, которую человек успевал
+    начать говорить в этой тишине, попадало в выброшенные кадры.
+    """
+    import numpy as np
+    import assistant
+
+    rate = 16000
+    tone = np.sin(2 * np.pi * 440 * np.arange(int(rate * 0.2)) / rate).astype("float32")
+    padded = np.concatenate([np.zeros(int(rate * 0.3), dtype="float32"), tone,
+                             np.zeros(int(rate * 0.5), dtype="float32")])
+    cut = assistant.trim_cue(padded, rate, 5.0)
+    seconds = len(cut) / rate
+    true(0.2 <= seconds <= 0.26,
+         f"осталась слышимая часть с полями, а не файл целиком ({seconds:.2f} с) "
+         f"было {len(padded) / rate:.2f} с")
+    true(abs(float(cut[0])) < 0.01 and abs(float(cut[-1])) < 0.01,
+         "края приглушены: на обрезке нет щелчка")
+    true(float(np.max(np.abs(cut))) > 0.3, "сам звук остался на месте")
+
+    quiet = np.full(int(rate * 0.2), 0.01, dtype="float32")
+    kept = assistant.trim_cue(quiet, rate, 5.0)
+    true(len(kept) > int(rate * 0.15),
+         "тихая, но не немая запись не схлопывается: порог берётся и от пика")
+
+    silent = np.zeros(int(rate * 0.4), dtype="float32")
+    eq(len(assistant.trim_cue(silent, rate, 0.2)), int(rate * 0.2),
+       "полностью тихий файл обрезку не роняет")
+
+
+def test_played_seconds():
+    """Длина для слива берётся у подготовленного файла, а не у исходника."""
+    import tempfile
+    import types
+    import assistant
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "wake.wav")
+        with open(path, "wb") as handle:
+            handle.write(b"x")
+        fake = types.ModuleType("soundfile")
+        fake.info = lambda p: types.SimpleNamespace(duration=0.32)
+        real = sys.modules.get("soundfile")
+        sys.modules["soundfile"] = fake
+        try:
+            eq(assistant.played_seconds(path), 0.32,
+               "длина подготовленного сигнала читается из его файла")
+        finally:
+            if real is None:
+                sys.modules.pop("soundfile", None)
+            else:
+                sys.modules["soundfile"] = real
+
+    eq(assistant.played_seconds(os.path.join(tmp, "нет-такого.wav")), 0.0,
+       "нет файла — ноль, а не исключение: цикл возьмёт оценку по исходнику")
+    true(assistant.PREPARED_CUE.endswith("wake.wav"),
+         "подготовленный сигнал лежит по известному пути")
+
+
 def test_cue_files():
     """Свои сигналы: список для панели, поиск по имени, проверка на опечатку."""
     import tempfile
@@ -1240,7 +1302,8 @@ def main() -> int:
                test_accusative_detection, test_resolve_threads,
                test_worker_protocol, test_worker_framing,
                test_assistant_reply, test_mono_from_bytes,
-               test_trim_cue, test_cue_files,
+               test_trim_cue, test_trim_cue_silence, test_played_seconds,
+               test_cue_files,
                test_cue_file_seconds,
                test_voiced_constants, test_wake_tones, test_beep_plays_once,
                test_kws_grammar, test_kws_spotter,

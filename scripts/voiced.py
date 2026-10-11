@@ -341,9 +341,13 @@ def main() -> int:
             return
         if rc != 0:
             print(f"[kws] сигнал {value} не проигрался (aplay rc={rc})", flush=True)
-        tail = max(args.beep_tail_frames, math.ceil(
-            (assistant.tone_seconds(value, seconds=seconds) + 0.12)
-            * SAMPLE_RATE / FRAME))
+        # Длина берётся у ПОДГОТОВЛЕННОГО файла (это ровно то, что сыграло):
+        # исходник мог быть длиннее своего звука за счёт тишины в хвосте, и слив
+        # тогда съедал начало команды — если считать по нему.
+        length = assistant.played_seconds() or assistant.tone_seconds(
+            value, seconds=seconds)
+        tail = max(args.beep_tail_frames,
+                   math.ceil((length + 0.12) * SAMPLE_RATE / FRAME))
         for _ in range(tail):
             if read_frame() is None:
                 break

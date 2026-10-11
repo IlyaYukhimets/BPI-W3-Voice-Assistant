@@ -196,21 +196,44 @@ def cue_duration(path: str) -> float:
         return 0.0                        # и скажет внятно, что с ним не так
 
 
-def trim_cue(data, rate: int, seconds: float = CUE_SECONDS):
-    """Обрезать сигнал до нужной длины и убрать щелчки по краям.
+def trim_cue(data, rate: int, seconds: float = CUE_SECONDS,
+             silence_floor: float = 0.005):
+    """Обрезать сигнал: сначала неслышимые края, потом длину, потом щелчки.
 
     Чистая функция: на входе массив из soundfile (моно или стерео, любой формат),
-    на выходе моно нужной длины. Файлы чужих записей всегда начинаются и
-    заканчиваются щелчком, а играем мы в колонку на полной громкости, поэтому
-    края приглушаются, а громкость выравнивается по встроенным вариантам.
+    на выходе моно нужной длины.
+
+    ПОЧЕМУ СНАЧАЛА ТИШИНА. Слив кадров после сигнала считается по его длине,
+    поэтому хвостовая тишина в файле — это мёртвое время, за которое человек
+    успевает начать говорить, и начало фразы попадает в выброшенные кадры. Живой
+    случай: у open.ogg звук кончался раньше файла, и фраза обрывалась. Поэтому
+    играем ровно слышимую часть: тишина по краям не тратит окно после сигнала.
+
+    Щелчки: чужие записи почти всегда начинаются и обрываются на середине волны,
+    а играем мы в колонку на полной громкости — края приглушаются, громкость
+    выравнивается по встроенным вариантам.
     """
     import numpy as np
 
     samples = np.asarray(data, dtype="float32")
     if samples.ndim > 1:                      # колонка одна: стерео сводим в моно
         samples = samples.mean(axis=1)
+    samples = samples.copy()
+
+    # Слышимые края: порог берём и от пика записи (тихая запись не должна
+    # схлопнуться в ничто), и абсолютный (шумовой пол файла отсекаем).
+    peak = float(np.max(np.abs(samples))) if len(samples) else 0.0
+    if peak > 0.0:
+        threshold = max(silence_floor, peak * 0.02)
+        loud = np.where(np.abs(samples) > threshold)[0]
+        if len(loud):
+            # Поля вокруг звука: без них срезается атака первого слога.
+            start = max(0, int(loud[0]) - int(rate * 0.01))
+            end = min(len(samples), int(loud[-1]) + 1 + int(rate * 0.03))
+            samples = samples[start:end]
+
     keep = min(len(samples), max(1, int(rate * seconds)))
-    samples = samples[:keep].copy()
+    samples = samples[:keep]
     fade_in = min(int(rate * 0.005), keep)
     fade_out = min(int(rate * 0.03), keep)
     if fade_in:
@@ -221,6 +244,24 @@ def trim_cue(data, rate: int, seconds: float = CUE_SECONDS):
     if peak > PEAK_LEVEL:                    # громкость как у встроенных сигналов
         samples = samples * (PEAK_LEVEL / peak)
     return samples
+
+
+PREPARED_CUE = os.path.join(os.path.expanduser("~/.assistant"), "wake.wav")
+
+
+def played_seconds(path: str = PREPARED_CUE) -> float:
+    """Длина ПОДГОТОВЛЕННОГО сигнала — ровно того, что ушло в колонку.
+
+    Число кадров на слив считается по ней, а не по длине исходного файла: файл
+    может быть длиннее своего звука (тишина в хвосте), и тогда слив съедал начало
+    команды. Подготовленный файл лежит рядом, и его длина известна точно.
+    """
+    try:
+        import soundfile as sf
+
+        return float(sf.info(path).duration)
+    except Exception:                     # noqa: BLE001 — тогда считаем по исходнику
+        return 0.0
 
 
 def prepare_cue(value: str = DEFAULT_WAKE_TONE, seconds: float = CUE_SECONDS,
@@ -234,7 +275,7 @@ def prepare_cue(value: str = DEFAULT_WAKE_TONE, seconds: float = CUE_SECONDS,
     """
     import tts_core as core
 
-    prepared = path or os.path.join(os.path.expanduser("~/.assistant"), "wake.wav")
+    prepared = path or PREPARED_CUE
     os.makedirs(os.path.dirname(prepared), exist_ok=True)
     source = cue_source(value)
     if source is None:
@@ -288,7 +329,7 @@ def beep(device: str | None = None, kind: str = DEFAULT_WAKE_TONE,
     """
     import tts_core as core
 
-    path = os.path.join(os.path.expanduser("~/.assistant"), "wake.wav")
+    path = PREPARED_CUE
     prepare_cue(kind, seconds, path)
     return core.play(path, device=device or core.DEFAULT_DEVICE, timeout=10)
 def make_reply(text: str, template: str = DEFAULT_TEMPLATE) -> str:
