@@ -670,7 +670,7 @@ def test_wake_tones():
         samples = assistant.wake_tone(kind)
         true(len(samples) > 0, f"«{kind}»: сигнал не пустой")
         seconds = assistant.tone_seconds(kind)
-        true(0.05 < seconds <= 0.2,
+        true(0.05 < seconds <= 0.5,
              f"«{kind}»: {seconds:.2f} с — короткая отбивка, а не мелодия")
         peak = max(abs(float(x)) for x in samples)
         true(peak <= 0.5, f"«{kind}»: пик {peak:.2f} — без клиппинга в колонке")
@@ -683,6 +683,20 @@ def test_wake_tones():
        "варианты действительно разные, а не один и тот же тон")
     true(assistant.DEFAULT_WAKE_TONE in assistant.WAKE_TONES,
          "сигнал по умолчанию есть среди вариантов")
+    eq(sorted(assistant.WAKE_TONE_LABELS), sorted(assistant.WAKE_TONES),
+       "у каждого варианта есть подпись для списка в панели")
+    true(all(assistant.WAKE_TONE_LABELS.values()),
+         "подписи не пустые — иначе в списке будут пустые строки")
+
+    # Колокольчик собран из частичных тонов со своим затуханием у каждого, и они
+    # НЕ по гармоникам, как у синусоиды: иначе звук «пластмассовый».
+    true(len(assistant.BELL_PARTIALS) >= 4, "у колокольчика несколько частичных тонов")
+    ratios = [r for r, _, _ in assistant.BELL_PARTIALS]
+    true(any(abs(r - round(r)) > 0.1 for r in ratios),
+         "частичные тоны не по гармоникам — иначе это синтезатор, а не колокол")
+    decays = [d for _, _, d in assistant.BELL_PARTIALS]
+    eq(decays, sorted(decays, reverse=True),
+       "высокие частичные затухают быстрее низких — так звучит удар")
 
     raised = False
     try:
@@ -953,6 +967,25 @@ def test_panel_parse():
     true("эй астра" in joined, "формы имени из ExecStart целиком")
     eq(panel.exec_from_cat("[Service]\nRestart=on-failure\n"), "",
        "без ExecStart пусто, без исключений")
+
+    # Сделать сигнал рабочим: значение меняется на месте, ключа нет — добавляем.
+    unit = ("[Service]\n"
+            "ExecStart=%h/python %h/voiced.py \\\n"
+            "  --device plughw:5,0 \\\n"
+            "  --wake-tone chime \\\n"
+            "  --spool-dir %h/.assistant/segments\n")
+    patched = panel.set_option_in_text(unit, "--wake-tone", "doorbell")
+    true("--wake-tone doorbell" in patched, "сигнал в юните заменён на выбранный")
+    eq(patched.count("--wake-tone"), 1, "второй такой ключ не появился")
+    eq(panel.exec_option(patched, "--wake-tone"), "doorbell",
+       "и читается обратно уже новое значение")
+    true("--device plughw:5,0" in patched, "остальные ключи не тронуты")
+
+    without = unit.replace("  --wake-tone chime \\\n", "")
+    added = panel.set_option_in_text(without, "--wake-tone", "bell")
+    true("--wake-tone bell" in added, "нет ключа — он добавляется в ExecStart")
+    eq(panel.exec_option(added, "--wake-tone"), "bell", "и сразу читается обратно")
+    true("--spool-dir" in added, "продолжения ExecStart не разорваны")
 
     # Значения ключей: одно слово (устройство) и список в кавычках (имена).
     eq(panel.exec_option('--device plughw:5,0 --kws-phrases "астра,астры"',

@@ -30,6 +30,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -299,6 +300,53 @@ def host_info() -> dict:
     return info
 
 
+VOICED_UNIT = os.path.expanduser("~/.config/systemd/user/voiced.service")
+
+
+def set_option_in_text(text: str, name: str, value: str) -> str:
+    """Прописать значение ключа в тексте юнита.
+
+    Ключ есть — меняем значение. Ключа нет — добавляем его отдельной строкой
+    сразу после ExecStart: команда в юните разбита продолжениями через «\\»,
+    поэтому строка встаёт в тот же список аргументов.
+    """
+    if re.search(rf"{re.escape(name)}\s+\S+", text):
+        return re.sub(rf"({re.escape(name)}\s+)\S+", rf"\g<1>{value}", text, count=1)
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("ExecStart="):
+            lines.insert(index + 1, f"  {name} {value} \\")
+            break
+    return "\n".join(lines) + "\n"
+
+
+def set_wake_tone(kind: str) -> dict:
+    """Сделать сигнал рабочим: правка юнита с бэкапом и перезапуск цикла.
+
+    Панель по умолчанию ничего не меняет, поэтому и это действие — за ключом.
+    Бэкап обязателен: юнит запускает резидентную службу, и опечатка в нём
+    оставила бы ассистента без звука и без объяснений.
+    """
+    if kind not in assistant.WAKE_TONES:
+        return {"ok": False, "message": f"неизвестный сигнал: {kind}"}
+    try:
+        with open(VOICED_UNIT, encoding="utf-8") as handle:
+            before = handle.read()
+        after = set_option_in_text(before, "--wake-tone", kind)
+        if after == before:
+            return {"ok": True, "message": f"сигнал уже {kind}"}
+        shutil.copy2(VOICED_UNIT, VOICED_UNIT + ".bak")
+        with open(VOICED_UNIT, "w", encoding="utf-8") as handle:
+            handle.write(after)
+    except OSError as exc:
+        return {"ok": False, "message": f"юнит не правится: {exc}"}
+    run(["systemctl", "--user", "daemon-reload"])
+    run(["systemctl", "--user", "restart", "voiced"])
+    print(f"[panel] сигнал в юните: {kind} (бэкап {os.path.basename(VOICED_UNIT)}.bak)",
+          flush=True)
+    return {"ok": True, "message": f"сигнал «{kind}» прописан в юните, цикл перезапущен"}
+
+
 def exec_option(exec_line: str, name: str, default: str = "") -> str:
     """Значение ключа из ExecStart: `--key значение` или `--key "значение"`.
 
@@ -399,6 +447,9 @@ def do_action(payload: dict, token: str) -> dict:
             return {"ok": False, "message": f"неизвестная служба: {unit}"}
         out = run(["systemctl", "--user", "restart", unit], timeout=20)
         return {"ok": True, "message": f"{unit}: перезапуск отправлен"}
+    if action == "set_tone":
+        return set_wake_tone(str(payload.get("kind") or assistant.DEFAULT_WAKE_TONE))
+
     if action == "tone":
         kind = str(payload.get("kind") or assistant.DEFAULT_WAKE_TONE)
         if kind not in assistant.WAKE_TONES:
@@ -456,7 +507,8 @@ def state(token: str) -> dict:
                        if f.endswith(".md")),
         "actions": bool(token),
         "wake_phrases": wake_phrases(voiced_exec),
-        "tones": list(assistant.WAKE_TONES),
+        "tones": [{"kind": k, "label": assistant.WAKE_TONE_LABELS.get(k, k)}
+                  for k in assistant.WAKE_TONES],
         "tone": exec_option(voiced_exec, "--wake-tone",
                              assistant.DEFAULT_WAKE_TONE),
         "ts": time.strftime("%H:%M:%S"),
@@ -585,16 +637,15 @@ font-size:13px;display:none;z-index:30}
       </div>
       <div class="btns">
         <select id="tone"></select>
-        <button class="act" data-act="tone">прослушать сигнал</button>
-        <span class="dim mono" id="tone-cur" style="font-size:11.5px;
-          align-self:center"></span>
+        <button class="act" data-act="tone">прослушать</button>
+        <button class="act" data-act="set_tone">сделать рабочим</button>
       </div>
-      <div class="hint"><b>Сигнал после имени:</b> chime — две ноты вверх,
-        blip — один скользящий, soft — мягкая нота пониже, tone — прежний тон
-        880 Гц. Выбери в списке и нажми «прослушать» — услышишь его в колонке;
-        каким он играется в цикле, написано рядом. «Сказать имя» выводит на
+      <div class="hint"><b>Сигнал после имени.</b> «Прослушать» играет вариант в
+        колонке, «сделать рабочим» прописывает его в юните (с бэкапом) и
+        перезапускает цикл — дальше все сигналы идут этим звуком. В цикле сейчас:
+        <span class="mono" id="tone-cur">?</span>. «Сказать имя» выводит на
         колонку имя ассистента: он услышит себя через микрофон, сработает KWS и
-        даст сигнал — это сквозная проверка тракта.</div></section>
+        даст сигнал — сквозная проверка тракта.</div></section>
     <section><h2>Модели</h2><table id="models"></table></section>
     <section><h2>Файлы сегментов</h2><table id="spool"></table></section>
   </div>
@@ -682,6 +733,7 @@ document.querySelector('#doc .close').addEventListener('click', () => $('modal')
 document.addEventListener('keydown', e => { if (e.key === 'Escape') $('modal').classList.remove('on'); });
 
 let wakeName = 'астра';        // из ExecStart: кнопка «сказать имя»
+let tonePicked = false;        // пользователь сам выбрал сигнал в списке
 
 async function act(btn){
   const action = btn.dataset.act;
@@ -690,6 +742,7 @@ async function act(btn){
   if (action === 'say') body.text = $('phrase').value;
   if (action === 'say_name'){ body.action = 'say'; body.text = wakeName; }
   if (action === 'tone') body.kind = $('tone').value;
+  if (action === 'set_tone') body.kind = $('tone').value;
   btn.disabled = true;
   try {
     const r = await fetch('/api/action', {method:'POST',
@@ -697,6 +750,8 @@ async function act(btn){
       body: JSON.stringify(body)});
     const d = await r.json();
     note(d.message + (d.ok ? '' : ' — ошибка'), !d.ok);
+    // после применения снова следуем за юнитом
+    if (d.ok && action === 'set_tone') tonePicked = false;
   } catch(e){ note('панель не ответила', true); }
   btn.disabled = false;
   tick();
@@ -705,6 +760,7 @@ document.addEventListener('click', e => { if (e.target.classList.contains('act')
 $('phrase').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); act({dataset:{act:'say'}}); }
 });
+$('tone').addEventListener('change', () => { tonePicked = true; });
 
 function drawChart(hist){
   const svg = $('chart');
@@ -793,14 +849,16 @@ async function tick(){
   $('docs').innerHTML = (d.docs||[]).map(f =>
     `<span class="chip" data-doc="${esc(f)}">${esc(f.replace(/\.md$/, ''))}</span>`
   ).join('');
+  // Список заполняется один раз и НЕ перезаписывается на каждом обновлении:
+  // иначе выбор пользователя откатывался к значению из юнита каждые 3 с.
   const tones = d.tones || [];
   if (tones.length && $('tone').options.length !== tones.length){
     $('tone').innerHTML = tones.map(t =>
-      `<option value="${esc(t)}">${esc(t)}</option>`).join('');
+      `<option value="${esc(t.kind)}">${esc(t.label)}</option>`).join('');
   }
   if (d.tone){
-    $('tone').value = d.tone;
-    $('tone-cur').textContent = 'в цикле: ' + d.tone;
+    if (!tonePicked) $('tone').value = d.tone;
+    $('tone-cur').textContent = d.tone;
   }
   if ((d.wake_phrases||[]).length){
     wakeName = d.wake_phrases[0];

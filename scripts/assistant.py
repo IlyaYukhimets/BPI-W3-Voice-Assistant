@@ -21,59 +21,97 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_TEMPLATE = "Принято: {text}."
 
 
-# Варианты сигнала пробуждения. Исходный — чистый тон 880 Гц: одна синусоида без
-# обертонов, звучит как пищалка измерительного прибора. Остальные — короткие
-# отбивки: мягкая атака (резкий старт даёт щелчок в колонке), затухание и тихие
-# гармоники, отсюда «колокольчик» вместо сигнала таймера.
-WAKE_TONES = ("chime", "blip", "soft", "tone")
-DEFAULT_WAKE_TONE = "chime"
+# Набор сигналов пробуждения.
+#
+# Прежний «tone» — чистая синусоида: звучит как пищалка измерительного прибора.
+# Остальные собраны как настоящий инструмент: у колокольчика частичные тоны стоят
+# НЕ по гармоникам (1, 2, 2.76, 4.07, 5.43 — так устроен колокол), и высокие
+# затухают быстрее низких. Именно поэтому он звучит колокольчиком, а не
+# синтезатором: у синусоиды обертонов нет вовсе, а у гармоник 2-4-8 звук
+# «пластмассовый». Атака короткая (иначе щелчок), спад в конце обязателен.
+WAKE_TONES = ("bell", "doorbell", "chime", "marimba", "pop", "tone")
+DEFAULT_WAKE_TONE = "bell"
+PEAK_LEVEL = 0.35            # общая громкость сигнала: выше — уже слышно клиппинг
+WAKE_TONE_LABELS = {
+    "bell": "колокольчик (один удар)",
+    "doorbell": "динь-дон (две ноты вниз)",
+    "chime": "две ноты вверх",
+    "marimba": "маримба (деревянный)",
+    "pop": "мягкий щелчок",
+    "tone": "прежний тон 880 Гц",
+}
+# (отношение частоты, громкость, доля от длительности на затухание)
+BELL_PARTIALS = ((1.0, 1.00, 1.00), (2.0, 0.50, 0.60), (2.76, 0.28, 0.45),
+                 (4.07, 0.16, 0.30), (5.43, 0.09, 0.20))
+WOOD_PARTIALS = ((1.0, 1.00, 1.00), (4.0, 0.32, 0.45), (9.2, 0.10, 0.25))
+
+
+def _struck_note(freq: float, dur: float, amp: float, sample_rate: int,
+                  partials=BELL_PARTIALS, attack: float = 0.004):
+    """Удар по инструменту: сумма частичных тонов со своим затуханием у каждого."""
+    import numpy as np
+
+    count = max(1, int(sample_rate * dur))
+    t = np.arange(count, dtype=np.float32) / sample_rate
+    wave = np.zeros(count, dtype=np.float32)
+    for ratio, level, decay in partials:
+        wave += level * np.exp(-t / (decay * dur)) * np.sin(2 * np.pi * freq * ratio * t)
+    env = np.minimum(t / attack, 1.0) * np.clip((dur - t) / 0.008, 0.0, 1.0)
+    return wave * env * amp
+
+
+def _soft_pop(dur: float, amp: float, sample_rate: int):
+    """Короткий «щелчок» интерфейса: тон падает по частоте и быстро гаснет."""
+    import numpy as np
+
+    count = max(1, int(sample_rate * dur))
+    t = np.arange(count, dtype=np.float32) / sample_rate
+    freq = 1150.0 - 560.0 * (t / dur)
+    phase = 2 * np.pi * np.cumsum(freq) / sample_rate
+    env = np.minimum(t / 0.004, 1.0) * np.exp(-t / (0.35 * dur))
+    env = env * np.clip((dur - t) / 0.006, 0.0, 1.0)
+    return np.sin(phase) * env * amp
 
 
 def wake_tone(kind: str = DEFAULT_WAKE_TONE, sample_rate: int = 16000):
-    """Сигнал пробуждения: короткая отбивка длиной 0.1-0.2 с.
+    """Сигнал пробуждения: короткая отбивка длиной до 0.5 с.
 
-    Варианты: chime — две ноты вверх (по умолчанию), blip — один скользящий
-    звук, soft — одна мягкая нота пониже, tone — прежний тон 880 Гц (оставлен,
-    чтобы было с чем сравнить и чтобы вернуть прежнее поведение одной строкой).
+    Смысл сигнала — сказать «я слушаю, говори» без слов: пока ассистент говорит,
+    микрофон заглушён, и словесный отклик съел бы начало команды. Поэтому звук
+    короткий и не похож на речь.
     """
     import numpy as np
 
-    def note(freq: float, dur: float, amp: float, attack: float = 0.006,
-             decay: float = 0.05, harmonics=((2, 0.22), (3, 0.08))):
-        count = max(1, int(sample_rate * dur))
-        t = np.arange(count, dtype=np.float32) / sample_rate
-        env = np.minimum(t / attack, 1.0) * np.exp(-t / decay)
-        # Спад в самом конце обязателен: обрез ноты слышен как щелчок.
-        env = env * np.clip((dur - t) / 0.006, 0.0, 1.0)
-        wave = np.sin(2 * np.pi * freq * t)
-        for mult, level in harmonics:      # тихие обертоны — «колокольчику»
-            wave = wave + level * np.sin(2 * np.pi * freq * mult * t)
-        return (wave * env * amp).astype(np.float32)
+    def note(freq, dur, amp, partials=BELL_PARTIALS):
+        return _struck_note(freq, dur, amp, sample_rate, partials)
 
-    def glide(start: float, stop: float, dur: float, amp: float):
-        count = max(1, int(sample_rate * dur))
-        t = np.arange(count, dtype=np.float32) / sample_rate
-        freq = start + (stop - start) * (t / dur)
-        phase = 2 * np.pi * np.cumsum(freq) / sample_rate
-        env = np.minimum(t / 0.01, 1.0) * np.exp(-t / 0.045)
-        env = env * np.clip((dur - t) / 0.006, 0.0, 1.0)
-        return np.sin(phase) * env * amp
-
-    if kind == "tone":
+    if kind == "bell":                       # один удар колокольчика, до-мажор
+        samples = note(1046.5, 0.28, 0.26)
+    elif kind == "doorbell":                 # динь-дон: две ноты вниз, как у колонок
+        samples = np.concatenate([note(880.0, 0.17, 0.25),
+                                  note(659.3, 0.28, 0.27)])
+    elif kind == "chime":                    # две ноты вверх
+        samples = np.concatenate([note(784.0, 0.16, 0.24),
+                                 note(1046.5, 0.24, 0.26)])
+    elif kind == "marimba":                  # деревянный: частичные по 1, 4, 9.2
+        samples = note(1046.5, 0.30, 0.26, WOOD_PARTIALS)
+    elif kind == "pop":
+        samples = _soft_pop(0.09, 0.30, sample_rate)
+    elif kind == "tone":                     # прежний вариант, для сравнения
         count = max(1, int(sample_rate * 0.12))
         t = np.arange(count, dtype=np.float32) / sample_rate
         rise = np.minimum(t / 0.01, 1.0)
         fall = np.minimum((0.12 - t) / 0.02, 1.0)
         env = np.clip(np.minimum(rise, fall), 0.0, 1.0)
-        return (np.sin(2 * np.pi * 880.0 * t) * env * 0.35).astype(np.float32)
-    if kind == "blip":
-        return glide(700.0, 1050.0, 0.10, 0.30).astype(np.float32)
-    if kind == "soft":
-        return note(660.0, 0.16, 0.26, decay=0.09).astype(np.float32)
-    if kind != "chime":
+        samples = np.sin(2 * np.pi * 880.0 * t) * env
+    else:
         raise ValueError(f"неизвестный сигнал: {kind} (есть: {', '.join(WAKE_TONES)})")
-    return np.concatenate([note(784.0, 0.055, 0.26),
-                           note(1174.7, 0.115, 0.30, decay=0.07)]).astype(np.float32)
+
+    # Одинаковая громкость у всех вариантов: сумма частичных тонов у колокольчика
+    # даёт пик выше, чем у одиночной синусоиды, и без выравнивания один вариант
+    # звучал бы заметно громче другого.
+    peak = float(np.max(np.abs(samples))) or 1.0
+    return (samples * (PEAK_LEVEL / peak)).astype(np.float32)
 
 
 def tone_seconds(kind: str = DEFAULT_WAKE_TONE, sample_rate: int = 16000) -> float:
