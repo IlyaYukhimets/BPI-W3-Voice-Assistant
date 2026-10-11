@@ -39,6 +39,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import assistant   # noqa: E402  — варианты сигнала и значение по умолчанию
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UNITS = ("ttsd", "asrd", "voiced")
 SPOOL = os.path.expanduser("~/.assistant/segments")
@@ -297,12 +299,25 @@ def host_info() -> dict:
     return info
 
 
+def exec_option(exec_line: str, name: str, default: str = "") -> str:
+    """Значение ключа из ExecStart: `--key значение` или `--key "значение"`.
+
+    Сначала ищем форму в кавычках (в ней бывают пробелы — список имён), и только
+    потом одно слово: без этого `--device plughw:5,0 --kws-phrases "астра"`
+    отдавало бы всё до кавычки.
+    """
+    text = exec_line or ""
+    quoted = re.search(rf'{re.escape(name)}\s+"([^"]*)"', text)
+    if quoted:
+        return quoted.group(1).strip()
+    bare = re.search(rf"{re.escape(name)}\s+(\S+)", text)
+    return bare.group(1).strip() if bare else default
+
+
 def wake_phrases(exec_line: str) -> list[str]:
     """Формы имени из ExecStart юнита: нужны схеме и кнопке «сказать имя»."""
-    match = re.search(r"--kws-phrases\s+\"?([^\"\\]+)\"?", exec_line or "")
-    if not match:
-        return ["астра"]
-    return [p.strip() for p in match.group(1).split(",") if p.strip()]
+    return [p.strip() for p in exec_option(exec_line, "--kws-phrases", "астра")
+            .split(",") if p.strip()]
 
 
 def pipeline(units: list[dict], kws_stats: dict) -> list[dict]:
@@ -310,10 +325,10 @@ def pipeline(units: list[dict], kws_stats: dict) -> list[dict]:
     by_name = {u["name"]: u for u in units}
     voiced = by_name.get("voiced", {})
     options = voiced.get("exec", "")
-    mic = re.search(r"--device (\S+)", options)
+    mic = exec_option(options, "--device", "plughw:5,0")
     phrases = wake_phrases(options)
     return [
-        {"stage": "Микрофон", "detail": mic.group(1) if mic else "plughw:5,0",
+        {"stage": "Микрофон", "detail": mic,
          "state": "ok" if voiced.get("active") == "active" else "bad"},
         {"stage": "Vosk-KWS (имя)",
          "detail": ", ".join(phrases) + f"; срабатываний {kws_stats.get('hits', 0)}",
@@ -384,6 +399,15 @@ def do_action(payload: dict, token: str) -> dict:
             return {"ok": False, "message": f"неизвестная служба: {unit}"}
         out = run(["systemctl", "--user", "restart", unit], timeout=20)
         return {"ok": True, "message": f"{unit}: перезапуск отправлен"}
+    if action == "tone":
+        kind = str(payload.get("kind") or assistant.DEFAULT_WAKE_TONE)
+        if kind not in assistant.WAKE_TONES:
+            return {"ok": False, "message": f"неизвестный сигнал: {kind}"}
+        rc = assistant.beep(kind=kind)
+        return {"ok": rc == 0,
+                "message": (f"сигнал «{kind}» проигран" if rc == 0
+                            else f"сигнал «{kind}» не прозвучал (aplay rc={rc})")}
+
     if action in ("say", "say_name"):
         text = str(payload.get("text", ""))[:200].strip()
         if action == "say_name" and not text:
@@ -416,6 +440,7 @@ def state(token: str) -> dict:
     units = units_state()
     events = parse_events(journal("voiced", 120))
     add_history(events["segments"])
+    voiced_exec = next((u["exec"] for u in units if u["name"] == "voiced"), "")
     return {
         "host": host_info(),
         "units": units,
@@ -430,8 +455,10 @@ def state(token: str) -> dict:
         "docs": sorted(f for f in os.listdir(os.path.join(REPO, "docs"))
                        if f.endswith(".md")),
         "actions": bool(token),
-        "wake_phrases": wake_phrases(next((u["exec"] for u in units
-                                           if u["name"] == "voiced"), "")),
+        "wake_phrases": wake_phrases(voiced_exec),
+        "tones": list(assistant.WAKE_TONES),
+        "tone": exec_option(voiced_exec, "--wake-tone",
+                             assistant.DEFAULT_WAKE_TONE),
         "ts": time.strftime("%H:%M:%S"),
     }
 
@@ -466,6 +493,8 @@ border-radius:6px;padding:8px 10px;font:13px/1.45 system-ui;resize:vertical;
 min-height:56px}
 .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
 .hint{color:var(--dim);font-size:11.5px;margin-top:8px;line-height:1.45}
+select{background:#232a33;border:1px solid var(--line);color:var(--fg);
+border-radius:6px;padding:6px 8px;font:13px system-ui;min-width:110px}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
 .chip{border:1px solid var(--line);border-radius:12px;padding:2px 9px;font-size:12px;
 cursor:pointer;color:#9db6d8}
@@ -554,9 +583,18 @@ font-size:13px;display:none;z-index:30}
         <button class="act" data-act="say_name">сказать имя</button>
         <button class="act" data-act="asr">ASR по последнему</button>
       </div>
-      <div class="hint">«Сказать имя» выводит на колонку имя ассистента: он
-        услышит себя через микрофон, сработает KWS и даст сигнал — это сквозная
-        проверка тракта (микрофон → сторож имени → сигнал).</div></section>
+      <div class="btns">
+        <select id="tone"></select>
+        <button class="act" data-act="tone">прослушать сигнал</button>
+        <span class="dim mono" id="tone-cur" style="font-size:11.5px;
+          align-self:center"></span>
+      </div>
+      <div class="hint"><b>Сигнал после имени:</b> chime — две ноты вверх,
+        blip — один скользящий, soft — мягкая нота пониже, tone — прежний тон
+        880 Гц. Выбери в списке и нажми «прослушать» — услышишь его в колонке;
+        каким он играется в цикле, написано рядом. «Сказать имя» выводит на
+        колонку имя ассистента: он услышит себя через микрофон, сработает KWS и
+        даст сигнал — это сквозная проверка тракта.</div></section>
     <section><h2>Модели</h2><table id="models"></table></section>
     <section><h2>Файлы сегментов</h2><table id="spool"></table></section>
   </div>
@@ -651,6 +689,7 @@ async function act(btn){
   if (action === 'restart') body.unit = btn.dataset.unit;
   if (action === 'say') body.text = $('phrase').value;
   if (action === 'say_name'){ body.action = 'say'; body.text = wakeName; }
+  if (action === 'tone') body.kind = $('tone').value;
   btn.disabled = true;
   try {
     const r = await fetch('/api/action', {method:'POST',
@@ -754,6 +793,15 @@ async function tick(){
   $('docs').innerHTML = (d.docs||[]).map(f =>
     `<span class="chip" data-doc="${esc(f)}">${esc(f.replace(/\.md$/, ''))}</span>`
   ).join('');
+  const tones = d.tones || [];
+  if (tones.length && $('tone').options.length !== tones.length){
+    $('tone').innerHTML = tones.map(t =>
+      `<option value="${esc(t)}">${esc(t)}</option>`).join('');
+  }
+  if (d.tone){
+    $('tone').value = d.tone;
+    $('tone-cur').textContent = 'в цикле: ' + d.tone;
+  }
   if ((d.wake_phrases||[]).length){
     wakeName = d.wake_phrases[0];
     const pretty = wakeName.charAt(0).toUpperCase() + wakeName.slice(1);

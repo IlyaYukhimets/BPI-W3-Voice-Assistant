@@ -608,6 +608,11 @@ def test_assistant_reply():
     import asr_ws
     import assistant
 
+    true("Home Assistant" not in assistant.DEFAULT_TEMPLATE
+         and "шаблон" not in assistant.DEFAULT_TEMPLATE,
+         "в ответе нет служебной приписки про шаблон и Home Assistant")
+    true(assistant.make_reply("включить свет").startswith("Принято:"),
+         "ответ начинается с подтверждения")
     eq(assistant.make_reply("включить свет"),
        assistant.DEFAULT_TEMPLATE.replace("{text}", "включить свет"),
        "шаблон по умолчанию подставляет распознанный текст")
@@ -633,6 +638,58 @@ def test_assistant_reply():
     true(req["path"].startswith("/api/services/"),
          "путь ведёт в services-API Home Assistant")
     eq(req["json"]["text"], "включить свет", "текст кладётся в тело запроса")
+
+
+def test_voiced_constants():
+    """Имена, к которым обращается цикл, должны существовать у своих модулей.
+
+    Живая проверка после опечатки: voiced считал длину сигнала через
+    kws.SAMPLE_RATE, а эти константы объявлены в самом voiced — служба падала на
+    AttributeError сразу после первого срабатывания имени.
+    """
+    import kws
+    import voiced
+
+    import inspect
+
+    eq(voiced.FRAME_BYTES, voiced.FRAME * 2, "кадр 16-битный: байтов вдвое больше")
+    eq(round(voiced.FRAME / voiced.SAMPLE_RATE * 1000), 32,
+       "кадр 32 мс — по нему считаются и сигнал, и запись")
+    default = inspect.signature(
+        kws.KwsSpotter.__init__).parameters["sample_rate"].default
+    eq(default, voiced.SAMPLE_RATE,
+       "KWS слушает с той же частотой, что и микрофон: иначе Vosk читает мусор")
+
+
+def test_wake_tones():
+    """Сигналы: короткие, без щелчков по краям, без клиппинга и различимые."""
+    import assistant
+
+    shapes = {}
+    for kind in assistant.WAKE_TONES:
+        samples = assistant.wake_tone(kind)
+        true(len(samples) > 0, f"«{kind}»: сигнал не пустой")
+        seconds = assistant.tone_seconds(kind)
+        true(0.05 < seconds <= 0.2,
+             f"«{kind}»: {seconds:.2f} с — короткая отбивка, а не мелодия")
+        peak = max(abs(float(x)) for x in samples)
+        true(peak <= 0.5, f"«{kind}»: пик {peak:.2f} — без клиппинга в колонке")
+        # Резкий старт и обрез ноты слышны как щелчок: проверяем края.
+        true(abs(float(samples[0])) < 0.01 and abs(float(samples[-1])) < 0.01,
+             f"«{kind}»: края на нуле — иначе колонка щёлкает")
+        shapes[kind] = tuple(round(float(x), 3) for x in samples[:400])
+
+    eq(len(set(shapes.values())), len(assistant.WAKE_TONES),
+       "варианты действительно разные, а не один и тот же тон")
+    true(assistant.DEFAULT_WAKE_TONE in assistant.WAKE_TONES,
+         "сигнал по умолчанию есть среди вариантов")
+
+    raised = False
+    try:
+        assistant.wake_tone("барабан")
+    except ValueError:
+        raised = True
+    true(raised, "неизвестный сигнал — ошибка, а не тихая подмена")
 
 
 def test_beep_plays_once():
@@ -897,6 +954,16 @@ def test_panel_parse():
     eq(panel.exec_from_cat("[Service]\nRestart=on-failure\n"), "",
        "без ExecStart пусто, без исключений")
 
+    # Значения ключей: одно слово (устройство) и список в кавычках (имена).
+    eq(panel.exec_option('--device plughw:5,0 --kws-phrases "астра,астры"',
+                         "--device"), "plughw:5,0",
+       "значение из одного слова берётся до пробела, а не до кавычки")
+    eq(panel.exec_option('--device plughw:5,0 --kws-phrases "астра,астры"',
+                         "--kws-phrases"), "астра,астры",
+       "список в кавычках берётся целиком, вместе с пробелами")
+    eq(panel.exec_option("--device plughw:5,0", "--wake-tone", "chime"), "chime",
+       "нет ключа — значение по умолчанию")
+
     # Формы имени берутся из ExecStart: по ним схема и кнопка «сказать имя».
     eq(panel.wake_phrases('--device plughw:5,0 --kws-phrases "астра,астры,эй астра"'),
        ["астра", "астры", "эй астра"], "формы имени читаются из ExecStart юнита")
@@ -941,7 +1008,8 @@ def main() -> int:
                test_accusative_detection, test_resolve_threads,
                test_worker_protocol, test_worker_framing,
                test_assistant_reply, test_mono_from_bytes,
-               test_beep_plays_once, test_kws_grammar, test_kws_spotter,
+               test_voiced_constants, test_wake_tones, test_beep_plays_once,
+               test_kws_grammar, test_kws_spotter,
                test_command_recorder,
                test_panel_parse):
         fn()

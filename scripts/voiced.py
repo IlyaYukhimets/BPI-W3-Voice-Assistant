@@ -225,6 +225,11 @@ def main() -> int:
                     help="куда складывать записанные команды (для segment-report)")
     ap.add_argument("--keep", type=int, default=20,
                     help="сколько сегментов хранить в spool")
+    ap.add_argument("--wake-tone", default=assistant.DEFAULT_WAKE_TONE,
+                    choices=list(assistant.WAKE_TONES),
+                    help="какой сигнал играть после имени (chime — две ноты, "
+                         "blip — скользящий, soft — мягкая нота, tone — прежний "
+                         "тон 880 Гц)")
     ap.add_argument("--no-wake-beep", action="store_true",
                     help="не играть сигнал после имени")
     ap.add_argument("--beep-tail-frames", type=int, default=6,
@@ -361,11 +366,20 @@ def main() -> int:
                     # 1.5 — терялось «Включи»).
                     drain()
                     if not args.no_wake_beep:
-                        rc = assistant.beep()
+                        rc = assistant.beep(kind=args.wake_tone)
                         if rc != 0:
                             print(f"[kws] сигнал не проигрался (aplay rc={rc})",
                                   flush=True)
-                    for _ in range(max(0, args.beep_tail_frames)):
+                    # Сколько кадров выбросить: длина сигнала плюс запас на
+                    # запуск aplay и путь звука до микрофона. Считаем из самого
+                    # сигнала — иначе длину отбивки и число кадров пришлось бы
+                    # согласовывать руками, а рассогласование кладёт тон внутрь
+                    # записи команды. Флаг --beep-tail-frames остаётся нижней
+                    # границей (запас на медленный старт aplay).
+                    tail = max(args.beep_tail_frames, math.ceil(
+                        (assistant.tone_seconds(args.wake_tone) + 0.12)
+                        * SAMPLE_RATE / FRAME))
+                    for _ in range(tail):
                         if read_frame() is None:
                             break
                     recorder = CommandRecorder(

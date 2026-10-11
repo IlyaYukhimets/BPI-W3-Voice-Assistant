@@ -15,32 +15,84 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Ответ по умолчанию. Признаётся вслух, поэтому без канцелярита: коротко,
-# понятно и честно — что услышано и что слой HA ещё не подключён.
-DEFAULT_TEMPLATE = ("Принято: {text}. Отвечаю шаблоном, "
-                    "запрос в Home Assistant будет на последнем этапе.")
+# Ответ по умолчанию. Произносится вслух, поэтому без канцелярита: принято —
+# и всё. Про шаблон и будущий запрос в Home Assistant в ответе не говорим: это
+# служебная кухня, а не ответ человеку (и она устареет, когда HA подключат).
+DEFAULT_TEMPLATE = "Принято: {text}."
 
-# Имя ассистента. «Астра» — редкое в бытовой речи слово, и акустически
-# удачное: начинается с открытой гласной, поэтому VAD ловит начало раньше,
-# чем на согласной (у «Джарвиса» тихая «дж» — замерено: слово давало всего
-# 7 окон выше порога при нужных 8). Список имён — через запятую.
-def wake_tone(sample_rate: int = 16000, freq: float = 880.0,
-              dur: float = 0.12, amp: float = 0.35):
-    """Нарастание/спад по краям тона: резкий старт даёт щелчок в колонке."""
+
+# Варианты сигнала пробуждения. Исходный — чистый тон 880 Гц: одна синусоида без
+# обертонов, звучит как пищалка измерительного прибора. Остальные — короткие
+# отбивки: мягкая атака (резкий старт даёт щелчок в колонке), затухание и тихие
+# гармоники, отсюда «колокольчик» вместо сигнала таймера.
+WAKE_TONES = ("chime", "blip", "soft", "tone")
+DEFAULT_WAKE_TONE = "chime"
+
+
+def wake_tone(kind: str = DEFAULT_WAKE_TONE, sample_rate: int = 16000):
+    """Сигнал пробуждения: короткая отбивка длиной 0.1-0.2 с.
+
+    Варианты: chime — две ноты вверх (по умолчанию), blip — один скользящий
+    звук, soft — одна мягкая нота пониже, tone — прежний тон 880 Гц (оставлен,
+    чтобы было с чем сравнить и чтобы вернуть прежнее поведение одной строкой).
+    """
     import numpy as np
-    t = np.arange(int(sample_rate * dur), dtype=np.float32) / sample_rate
-    rise = np.minimum(t / 0.01, 1.0)
-    fall = np.minimum((dur - t) / 0.02, 1.0)
-    env = np.clip(np.minimum(rise, fall), 0.0, 1.0)
-    return (np.sin(2 * np.pi * freq * t) * env * amp).astype(np.float32)
+
+    def note(freq: float, dur: float, amp: float, attack: float = 0.006,
+             decay: float = 0.05, harmonics=((2, 0.22), (3, 0.08))):
+        count = max(1, int(sample_rate * dur))
+        t = np.arange(count, dtype=np.float32) / sample_rate
+        env = np.minimum(t / attack, 1.0) * np.exp(-t / decay)
+        # Спад в самом конце обязателен: обрез ноты слышен как щелчок.
+        env = env * np.clip((dur - t) / 0.006, 0.0, 1.0)
+        wave = np.sin(2 * np.pi * freq * t)
+        for mult, level in harmonics:      # тихие обертоны — «колокольчику»
+            wave = wave + level * np.sin(2 * np.pi * freq * mult * t)
+        return (wave * env * amp).astype(np.float32)
+
+    def glide(start: float, stop: float, dur: float, amp: float):
+        count = max(1, int(sample_rate * dur))
+        t = np.arange(count, dtype=np.float32) / sample_rate
+        freq = start + (stop - start) * (t / dur)
+        phase = 2 * np.pi * np.cumsum(freq) / sample_rate
+        env = np.minimum(t / 0.01, 1.0) * np.exp(-t / 0.045)
+        env = env * np.clip((dur - t) / 0.006, 0.0, 1.0)
+        return np.sin(phase) * env * amp
+
+    if kind == "tone":
+        count = max(1, int(sample_rate * 0.12))
+        t = np.arange(count, dtype=np.float32) / sample_rate
+        rise = np.minimum(t / 0.01, 1.0)
+        fall = np.minimum((0.12 - t) / 0.02, 1.0)
+        env = np.clip(np.minimum(rise, fall), 0.0, 1.0)
+        return (np.sin(2 * np.pi * 880.0 * t) * env * 0.35).astype(np.float32)
+    if kind == "blip":
+        return glide(700.0, 1050.0, 0.10, 0.30).astype(np.float32)
+    if kind == "soft":
+        return note(660.0, 0.16, 0.26, decay=0.09).astype(np.float32)
+    if kind != "chime":
+        raise ValueError(f"неизвестный сигнал: {kind} (есть: {', '.join(WAKE_TONES)})")
+    return np.concatenate([note(784.0, 0.055, 0.26),
+                           note(1174.7, 0.115, 0.30, decay=0.07)]).astype(np.float32)
 
 
-def beep(device: str | None = None) -> int:
+def tone_seconds(kind: str = DEFAULT_WAKE_TONE, sample_rate: int = 16000) -> float:
+    """Длительность сигнала: по ней цикл выкидывает звук сигнала из записи.
+
+    Считаем из самого сигнала, а не держим в цикле второе магическое число:
+    иначе длина отбивки и число выбрасываемых кадров надо согласовывать руками,
+    а рассогласование кладёт тон внутрь записи команды.
+    """
+    return len(wake_tone(kind, sample_rate)) / sample_rate
+
+
+def beep(device: str | None = None, kind: str = DEFAULT_WAKE_TONE) -> int:
     """Короткий сигнал пробуждения — ТОН, а не слово.
 
     Говорить «слушаю» нельзя: пока ассистент говорит, микрофон заглушён, и
-    начало команды потерялось бы. 0.12 с тона в запись команды не попадают
-    (детектор стартует по трём кадрам), поэтому мьют для сигнала не нужен.
+    начало команды потерялось бы. Сам сигнал в запись не попадает: цикл ждёт
+    его окончания и выбрасывает ровно его длину (tone_seconds), поэтому мьют для
+    сигнала не нужен.
 
     Попытка ровно одна, повторов нет. Провальный aplay звука не даёт, зато
     занимает время, и отложенный сигнал приходит ровно тогда, когда колонка уже
@@ -54,7 +106,7 @@ def beep(device: str | None = None) -> int:
 
     path = os.path.join(os.path.expanduser("~/.assistant"), "wake.wav")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    core.write_audio(wake_tone(), path, ogg=False)
+    core.write_audio(wake_tone(kind), path, ogg=False)
     return core.play(path, device=device or core.DEFAULT_DEVICE, timeout=10)
 def make_reply(text: str, template: str = DEFAULT_TEMPLATE) -> str:
     """Реплика ассистента на распознанный текст.
