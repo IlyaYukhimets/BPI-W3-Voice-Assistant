@@ -154,83 +154,46 @@ def cue_source(value: str) -> str | None:
 
 
 def cue_ok(value: str) -> bool:
-    """Годится ли значение `--wake-tone`: встроенный вариант или существующий файл."""
-    return value in WAKE_TONES or cue_source(value) is not None
+    """Годится ли значение `--wake-tone`: встроенный вариант или читаемый звук.
 
-
-def decode_with_sox(path: str):
-    """Прочитать файл, который не понял soundfile.
-
-    Чужая запись часто оказывается не тем, чем выглядит: в каталоге сигналов лежал
-    «close.ogg» — контейнер Ogg с ВИДЕО Theora и звуковой дорожкой внутри.
-    soundfile такое не открывает («unimplemented format»), а sox читает и отдаёт
-    звук. Поэтому второй попыткой идём через sox (он есть на плате и понимает
-    больше форматов), а WAV разбираем стандартным `wave` — без новых зависимостей.
+    Проверяем не только наличие файла, но и что он открывается как звук: у
+    контейнера с видео расширение `.ogg` и он попал бы в список сигналов, а играть
+    из него нечего. Лучше сказать об этом в панели, чем оставить пользователя без
+    сигнала и без объяснений.
     """
-    try:
-        out = subprocess.run(["sox", path, "-b", "16", "-t", "wav", "-"],
-                             capture_output=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0 or not out.stdout:
-        return None
-    return wav_bytes_to_samples(out.stdout)
-
-
-def wav_bytes_to_samples(raw: bytes):
-    """Разобрать WAV из памяти: (данные, частота) или None, если формат не тот.
-
-    Отдельной функцией, потому что это единственное место, где мы разбираем аудио
-    сами (всё остальное делает soundfile): так её можно проверить тестом, не имея
-    ни sox, ни звуковой библиотеки.
-    """
-    import io
-    import wave
-
-    import numpy as np
-
-    try:
-        with wave.open(io.BytesIO(raw), "rb") as handle:
-            rate = handle.getframerate()
-            if handle.getsampwidth() != 2:
-                return None
-            channels = handle.getnchannels()
-            frames = handle.readframes(handle.getnframes())
-    except (wave.Error, EOFError):
-        return None
-    data = np.frombuffer(frames, dtype="<i2").astype("float32") / 32768.0
-    if channels > 1:
-        data = data.reshape(-1, channels)
-    return data, rate
+    if value in WAKE_TONES:
+        return True
+    source = cue_source(value)
+    return source is not None and cue_duration(source) > 0.0
 
 
 def decode_audio(path: str):
-    """Звук файла: soundfile, а если формат ему не по зубам — через sox."""
-    try:
-        import soundfile as sf
+    """Звук файла. Читаем только то, что понимает soundfile: ogg/wav/flac.
 
+    Через sox здесь больше не ходим. Контейнер с видео в каталоге сигналов — это
+    ошибка того, кто положил файл, а не рядовой случай, и правится она один раз
+    (`sox in.ogg out.ogg`), а не вторым декодером внутри программы. Так чтение
+    остаётся одним путём, а ошибка — внятной строкой в журнале.
+    """
+    import soundfile as sf
+
+    try:
         return sf.read(path, always_2d=True)
-    except Exception:                     # noqa: BLE001 — причину смотрим ниже
-        got = decode_with_sox(path)
-    if got is None:
-        raise ValueError(f"{os.path.basename(path)}: не читается как звук — "
-                         f"нужен ogg/wav/flac либо формат, который понимает sox")
-    return got
+    except Exception as exc:              # noqa: BLE001 — причину показываем целиком
+        raise ValueError(
+            f"{os.path.basename(path)}: не читается как звук ({exc}). Нужен "
+            f"ogg/wav/flac; контейнер с видео или другой формат перекодируй: "
+            f"sox исходник.ogg новый.ogg") from exc
 
 
 def cue_duration(path: str) -> float:
-    """Длительность файла: из заголовка (soundfile), иначе спрашиваем у sox."""
-    try:
-        import soundfile as sf
+    """Длительность файла из заголовка. 0.0 — если файл не открылся как звук."""
+    import soundfile as sf
 
-        return float(sf.info(path).duration)
-    except Exception:                     # noqa: BLE001 — см. decode_with_sox
-        pass
     try:
-        out = subprocess.run(["soxi", "-D", path], capture_output=True, timeout=30)
-        return float(out.stdout.decode().strip())
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return 0.0
+        return float(sf.info(path).duration)
+    except Exception:                     # noqa: BLE001 — файл разберёт decode_audio
+        return 0.0                        # и скажет внятно, что с ним не так
 
 
 def trim_cue(data, rate: int, seconds: float = CUE_SECONDS):

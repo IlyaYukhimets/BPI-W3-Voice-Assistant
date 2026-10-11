@@ -332,7 +332,13 @@ def main() -> int:
             print(f"[kws] {role} сигнал {os.path.basename(value)} "
                   f"({assistant.tone_seconds(value, seconds=seconds):.2f} с)",
                   flush=True)
-        rc = assistant.beep(kind=value, seconds=seconds)
+        try:
+            rc = assistant.beep(kind=value, seconds=seconds)
+        except (ValueError, OSError) as exc:
+            # Плохой файл сигнала — не повод терять ассистента: сказали в журнал и
+            # продолжаем слушать (раньше это было падение службы).
+            print(f"[kws] сигнал не сыграл: {exc}", flush=True)
+            return
         if rc != 0:
             print(f"[kws] сигнал {value} не проигрался (aplay rc={rc})", flush=True)
         tail = max(args.beep_tail_frames, math.ceil(

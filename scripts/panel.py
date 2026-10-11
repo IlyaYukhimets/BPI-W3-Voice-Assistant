@@ -992,7 +992,10 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(min(length, 4096)) or b"{}")
         except (ValueError, json.JSONDecodeError):
             payload = {}
-        result = do_action(payload, Handler.token)
+        try:
+            result = do_action(payload, Handler.token)
+        except Exception as exc:          # noqa: BLE001 — панель не должна падать
+            result = {"ok": False, "message": f"действие сорвалось: {exc}"}
         with Handler.lock:                 # состояние менялось — сбросим кэш
             Handler.cache = None
         self._json(result)

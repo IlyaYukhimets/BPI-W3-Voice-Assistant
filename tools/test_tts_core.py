@@ -683,10 +683,33 @@ def test_cue_files():
         true(assistant.cue_source(os.path.join(tmp, "beep.flac")) is not None,
              "путь к своему файлу принимается")
         true(assistant.cue_ok("bell"), "встроенный вариант годится")
-        true(assistant.cue_ok(os.path.join(tmp, "beep.flac")),
-             "существующий файл годится")
         true(not assistant.cue_ok(os.path.join(tmp, "нет-такого.ogg")),
              "несуществующий файл не годится — цикл скажет об этом при старте")
+
+        # Файл должен быть ЗВУКОМ: у контейнера с видео расширение .ogg, и он попал
+        # бы в список сигналов, а играть из него нечего (так и было: close.ogg с
+        # видео Theora внутри).
+        import types
+        fake = types.ModuleType("soundfile")
+        def _info(path, duration=1.5):
+            if os.path.basename(path) == "video.ogg":
+                raise RuntimeError("File contains data in an unimplemented format")
+            return types.SimpleNamespace(duration=duration)
+        fake.info = _info
+        with open(os.path.join(tmp, "video.ogg"), "wb") as handle:
+            handle.write(b"OggS theora")
+        real = sys.modules.get("soundfile")
+        sys.modules["soundfile"] = fake
+        try:
+            true(assistant.cue_ok(os.path.join(tmp, "beep.flac")),
+                 "существующий звуковой файл годится")
+            true(not assistant.cue_ok(os.path.join(tmp, "video.ogg")),
+                 "контейнер с видео не годится: панель скажет об этом, а не промолчит")
+        finally:
+            if real is None:
+                sys.modules.pop("soundfile", None)
+            else:
+                sys.modules["soundfile"] = real
 
 
 def test_cue_file_seconds():
@@ -713,40 +736,6 @@ def test_cue_file_seconds():
                 sys.modules.pop("soundfile", None)
             else:
                 sys.modules["soundfile"] = real
-
-
-def test_wav_bytes_to_samples():
-    """Разбор WAV из памяти: этим путём читаются файлы, которых не понял soundfile."""
-    import io
-    import wave
-    import numpy as np
-    import assistant
-
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as handle:
-        handle.setnchannels(2)
-        handle.setsampwidth(2)
-        handle.setframerate(16000)
-        handle.writeframes(np.array([[16000, -16000], [8000, 0]] * 100,
-                                    dtype="<i2").tobytes())
-    got = assistant.wav_bytes_to_samples(buf.getvalue())
-    true(got is not None, "WAV разобран")
-    data, rate = got
-    eq(rate, 16000, "частота взята из заголовка")
-    eq(data.shape, (200, 2), "стерео осталось двумя колонками, 200 кадров")
-    true(abs(float(data[0][0]) - 0.488) < 0.01,
-         "отсчёты переведены в диапазон -1..1")
-
-    mono8 = io.BytesIO()
-    with wave.open(mono8, "wb") as handle:
-        handle.setnchannels(1)
-        handle.setsampwidth(1)
-        handle.setframerate(8000)
-        handle.writeframes(b"\x80" * 10)
-    eq(assistant.wav_bytes_to_samples(mono8.getvalue()), None,
-       "не 16-битный WAV не берём: иначе получилась бы каша")
-    eq(assistant.wav_bytes_to_samples(b"not a wav"), None,
-       "мусор вместо файла не роняет программу")
 
 
 def test_voiced_constants():
@@ -1161,7 +1150,7 @@ def main() -> int:
                test_accusative_detection, test_resolve_threads,
                test_worker_protocol, test_worker_framing,
                test_assistant_reply, test_mono_from_bytes,
-               test_wav_bytes_to_samples, test_trim_cue, test_cue_files,
+               test_trim_cue, test_cue_files,
                test_cue_file_seconds,
                test_voiced_constants, test_wake_tones, test_beep_plays_once,
                test_kws_grammar, test_kws_spotter,
